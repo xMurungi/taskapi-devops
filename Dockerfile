@@ -1,6 +1,10 @@
 # --- build stage ---
 FROM python:3.11-slim AS builder
 WORKDIR /app
+
+# upgrade pip toolchain first to get patched versions
+RUN pip install --upgrade pip wheel jaraco.context
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
