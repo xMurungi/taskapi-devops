@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taskapi-allow-ingress
+  namespace: taskapi
+spec:
+  podSelector:
+    matchLabels:
+      app: taskapi
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 1234
+
+# only allow ingress to taskapi pods on port 5000

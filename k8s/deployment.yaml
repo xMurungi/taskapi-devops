@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskapi-deployment
+  namespace: taskapi
+  labels:
+    app: taskapi
+    version: "1.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: taskapi
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0            # zero-downtime deploys
+  template:
+    metadata:
+      labels:
+        app: taskapi
+        version: "1.0"
+    spec:
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true       # enforce non-root at pod level
+        runAsUser: 1000
+        # --- INSERTED BLOCK START ---
+      initContainers:
+      - name: fix-permissions
+        image: busybox:latest
+        command: ["sh", "-c", "chown -R 1000:1000 /app/data"]
+        securityContext:
+          runAsUser: 0            # Explicitly run as root to fix permissions
+          runAsNonRoot: false     # Allow root for this specific step
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+      # --- INSERTED BLOCK END ---
+      containers:
+        - name: taskapi
+          image: taskapi:k8s    # swap for registry image in CI
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 1234
+          envFrom:
+            - configMapRef:
+                name: taskapi-config
+            - secretRef:
+                name: taskapi-secret
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 1234
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 1234
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: taskapi-data

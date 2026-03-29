@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim  # <--- Must be this exact string
+metadata:
+  name: taskapi-data
+  namespace: taskapi
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi
+
+#  persistent volume for SQLite (swap for a real DB in prod)

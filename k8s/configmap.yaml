@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taskapi-config
+  namespace: taskapi
+data: 
+  FLASK_ENV: "production"
+  LOG_LEVEL: "info"
+  APP_PORT: "1234"
