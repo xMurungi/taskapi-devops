@@ -61,6 +61,7 @@ jobs:
           format: table
           exit-code: 1                                              # fail the pipeline on CRITICAL/HIGH CVEs
           severity: CRITICAL,HIGH
+          trivyignores: .trivyignore
 
       - name: Push image
         if: github.ref == 'refs/heads/main'                         # only push on main branch

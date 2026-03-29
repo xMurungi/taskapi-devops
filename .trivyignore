@@ -1,0 +1,5 @@
+# CVE-2026-24049: wheel vendored inside setuptools/_vendor/
+# wheel is a build/install tool and is not used at runtime in this container.
+# No wheel files are processed by the running application.
+# Fixed in wheel 0.46.2 — track upstream: https://avd.aquasec.com/nvd/cve-2026-24049
+CVE-2026-24049
