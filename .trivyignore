@@ -3,3 +3,16 @@
 # No wheel files are processed by the running application.
 # Fixed in wheel 0.46.2 — track upstream: https://avd.aquasec.com/nvd/cve-2026-24049
 CVE-2026-24049
+
+# CVE-2025-69720: ncurses buffer overflow in debian:13.4 base image
+# No fixed version available upstream. ncurses is a terminal library
+# not used by the Flask application at runtime.
+CVE-2025-69720
+
+# CVE-2026-27135: nghttp2 DoS via malformed HTTP/2 frames in debian:13.4
+# No fixed version available. nghttp2 is not used directly by the application.
+CVE-2026-27135
+
+# CVE-2026-29111: systemd arbitrary code execution in debian:13.4
+# No fixed version available. systemd is not invoked by the containerised app.
+CVE-2026-29111
