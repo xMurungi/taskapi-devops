@@ -40,7 +40,7 @@ spec:
       # --- INSERTED BLOCK END ---
       containers:
         - name: taskapi
-          image: taskapidevacr.azurecr.io/taskapi:latest   # CI will replace latest with SHA
+          image: taskapidevacr.azurecr.io/taskapi:e04789793525179e1c99a2986e4ec30a325e260f
           imagePullPolicy: Always    # was IfNotPresent — won't pull from ACR otherwise
           ports:
             - containerPort: 1234
