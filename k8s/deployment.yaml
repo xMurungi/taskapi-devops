@@ -40,7 +40,7 @@ spec:
       # --- INSERTED BLOCK END ---
       containers:
         - name: taskapi
-          image: taskapidevacr.azurecr.io/taskapi:7ca6bca2346574441923fd424ae99002ea7f1878
+          image: taskapidevacr.azurecr.io/taskapi:512e1e7035b22abb648c76bde3830ce278ad53ca
           imagePullPolicy: Always    # was IfNotPresent — won't pull from ACR otherwise
           ports:
             - containerPort: 1234
