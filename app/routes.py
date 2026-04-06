@@ -16,6 +16,20 @@ def get_tasks():
 @bp.post("/tasks")
 def post_task():
     data = request.get_json(silent=True) or {}
+
+    # Check if it’s a list of tasks
+    if isinstance(data, list):
+        created = []
+        for t_data in data:
+            if not t_data.get("title"):
+                continue  # skip invalid tasks
+            t = Task(title=t_data["title"], done=t_data.get("done", False))
+            db.session.add(t)
+            created.append(t)
+        db.session.commit()
+        return jsonify([t.to_dict() for t in created]), 201
+    
+    # Otherwise, single task
     if not data.get("title"):
         abort(400, "Title required")
     
