@@ -61,7 +61,9 @@ resource "azurerm_kubernetes_cluster" "main" {
 
   network_profile {
     network_plugin    = "azure"
-    load_balancer_sku = "basic"
+    load_balancer_sku = "standard"
+    service_cidr      = "10.1.0.0/16"    # ← separate range, no overlap
+    dns_service_ip    = "10.1.0.10"       # ← must be within service_cidr
   }
 
   tags = local.tags
