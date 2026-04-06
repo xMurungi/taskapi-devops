@@ -40,8 +40,8 @@ spec:
       # --- INSERTED BLOCK END ---
       containers:
         - name: taskapi
-          image: taskapi:k8s    # swap for registry image in CI
-          imagePullPolicy: IfNotPresent
+          image: taskapidevacr.azurecr.io/taskapi:latest   # CI will replace latest with SHA
+          imagePullPolicy: Always    # was IfNotPresent — won't pull from ACR otherwise
           ports:
             - containerPort: 1234
           envFrom:
