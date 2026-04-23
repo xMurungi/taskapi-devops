@@ -1,20 +1,9 @@
+cd /c/DevOps-NCBA/k8s-core-gitops-1/services/mpesa-daraja-adapter
+
 ~/c/DevOps-NCBA/k8s-core-gitops-1/sync-secrets.sh \
-  /c/DevOps-NCBA/k8s-core-gitops-1/services/mpesa-daraja-adapter \
   ncbakemobilemoneyapi-mpesa-daraja-adapter \
   ncba-core-test-kv
 
-# 1. Make it executable (one time)
-chmod +x ~/c/DevOps-NCBA/k8s-core-gitops-1/sync-secrets.sh
-
-# 2. Always dry-run first to see what it will touch
-~/c/DevOps-NCBA/.../sync-secrets.sh \
-  /c/DevOps-NCBA/.../services/mpesa-daraja-adapter \
-  ncbakemobilemoneyapi-mpesa-daraja-adapter \
-  ncba-core-test-kv \
-  --dry-run
-
-# 3. Make sure you're az login'd to the right subscription
-az account show
 
 #!/usr/bin/env bash
 # =============================================================================
@@ -50,15 +39,17 @@ log_info()   { echo -e "  ${DIM}→${RESET}  $1"; }
 log_dryrun() { echo -e "  ${YELLOW}[DRY-RUN]${RESET} $1"; }
 
 # ─── Args ─────────────────────────────────────────────────────────────────────
-SERVICE_DIR="${1:-}"
-PREFIX="${2:-}"
-VAULT_NAME="${3:-}"
+# Usage: script.sh <prefix> <vault-name> [--dry-run] [--skip-kv] [--skip-patch]
+# Run from inside the service folder — it uses your current directory automatically.
+PREFIX="${1:-}"
+VAULT_NAME="${2:-}"
+SERVICE_DIR="${PWD}"
 DRY_RUN=false
 SKIP_KV=false
 SKIP_PATCH=false
 
 # Parse optional flags from remaining args
-shift 3 2>/dev/null || true
+shift 2 2>/dev/null || true
 for arg in "$@"; do
   case "$arg" in
     --dry-run)    DRY_RUN=true   ;;
@@ -69,12 +60,11 @@ for arg in "$@"; do
 done
 
 # ─── Validate ─────────────────────────────────────────────────────────────────
-if [[ -z "$SERVICE_DIR" || -z "$PREFIX" || -z "$VAULT_NAME" ]]; then
-  echo -e "${RED}Usage: $0 <service-folder> <prefix> <vault-name> [--dry-run] [--skip-kv] [--skip-patch]${RESET}"
-  echo -e "${DIM}Example:${RESET}"
-  echo -e "  $0 /c/DevOps-NCBA/k8s-core-gitops-1/services/mpesa-daraja-adapter \\"
-  echo -e "     ncbakemobilemoneyapi-mpesa-daraja-adapter \\"
-  echo -e "     ncba-core-test-kv"
+if [[ -z "$PREFIX" || -z "$VAULT_NAME" ]]; then
+  echo -e "${RED}Usage: $0 <prefix> <vault-name> [--dry-run] [--skip-kv] [--skip-patch]${RESET}"
+  echo -e "${DIM}cd into the service folder first, then run:${RESET}"
+  echo -e "  cd /c/DevOps-NCBA/k8s-core-gitops-1/services/mpesa-daraja-adapter"
+  echo -e "  $0 ncbakemobilemoneyapi-mpesa-daraja-adapter ncba-core-test-kv"
   exit 1
 fi
 
