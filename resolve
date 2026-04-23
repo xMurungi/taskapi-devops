@@ -1,1 +1,1 @@
-git stash pop && git stash && ~/c/DevOps-NCBA/k8s-core-gitops-1/fix-env.sh ncbaugbillersapi-ura-adapter ncba-core-test-kv --skip-patch && git stash pop
+git stash pop && git add -A && git commit -m "chore: sync remaining secrets and patch deployments/SPCs"
