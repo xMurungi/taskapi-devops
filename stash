@@ -1,0 +1,1 @@
+git stash && ~/c/DevOps-NCBA/k8s-core-gitops-1/sync-all-secrets.sh ncba-ke-billers-jambopay ncba-core-test-kv --skip-patch 2>&1 | tee failed-uploads.log && grep "✘" failed-uploads.log > failed-secrets.txt && git stash pop
