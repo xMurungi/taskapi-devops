@@ -1,0 +1,1 @@
+git checkout --ours apps/base/spg-workers-core/deployment.yaml && git checkout --ours apps/base/spg-workers-core/secretproviderclass.yaml && git add apps/base/spg-workers-core/deployment.yaml apps/base/spg-workers-core/secretproviderclass.yaml
