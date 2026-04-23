@@ -1,4 +1,4 @@
-cd /c/DevOps-NCBA/k8s-core-gitops-1/services/mpesa-daraja-adapter
+~/c/DevOps-NCBA/k8s-core-gitops-1/sync-secrets.sh ncbakemobilemoneyapi-mpesa-daraja-adapter ncba-core-test-kv --dry-run
 
 ~/c/DevOps-NCBA/k8s-core-gitops-1/sync-secrets.sh \
   ncbakemobilemoneyapi-mpesa-daraja-adapter \
