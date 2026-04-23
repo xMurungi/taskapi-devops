@@ -4,18 +4,12 @@ cd /c/DevOps-NCBA/k8s-core-gitops-1/services/mpesa-daraja-adapter
   ncbakemobilemoneyapi-mpesa-daraja-adapter \
   ncba-core-test-kv
 
-# 1. Make it executable (one time)
-chmod +x ~/c/DevOps-NCBA/k8s-core-gitops-1/sync-secrets.sh
+cd /c/DevOps-NCBA/k8s-core-gitops-1/services/mpesa-daraja-adapter
 
-# 2. Always dry-run first to see what it will touch
-~/c/DevOps-NCBA/.../sync-secrets.sh \
-  /c/DevOps-NCBA/.../services/mpesa-daraja-adapter \
+~/c/DevOps-NCBA/k8s-core-gitops-1/sync-secrets.sh \
   ncbakemobilemoneyapi-mpesa-daraja-adapter \
   ncba-core-test-kv \
   --dry-run
-
-# 3. Make sure you're az login'd to the right subscription
-az account show
 
 #!/usr/bin/env bash
 # =============================================================================
