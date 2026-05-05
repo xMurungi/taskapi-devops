@@ -2,26 +2,25 @@
 # =============================================================================
 # cluster-to-kv.py
 # Reconciles Kubernetes secrets (cluster as source of truth) with Azure KV.
-# Uses SPC secretObjects as the authoritative list of what should be in KV.
+# Uses kubectl directly — no SPC files, no deployment manifests.
 #
 # Flow:
-#   1. Select namespace(s) to scan
-#   2. Read SPC files to discover expected secrets
-#   3. Fetch each secret value from the cluster
-#   4. Compare with KV — list missing, show mismatches visually
-#   5. Confirm before uploading missing secrets to KV
-#   6. Verify each upload before moving to next
-#   7. Log everything (including plaintext) to a log file
+#   1. Show current kubectl context — confirm you're on the right cluster
+#   2. Select namespace(s) to scan
+#   3. kubectl get secrets — list all non-system secrets
+#   4. For each secret key, check if it exists in KV by the same name
+#   5. Compare values via checksum — show visual diff in terminal
+#   6. List missing — confirm before uploading to KV
+#   7. Log everything (including plaintext values) to a log file
 #
 # Usage:
-#   python3 cluster-to-kv.py --vault ncba-core-test-kv [--dry-run] [--base-dir /path/to/apps/base]
+#   python3 cluster-to-kv.py --vault ncba-core-test-kv [--dry-run]
 #
 # kubectl setup notes:
-#   - Make sure kubectl is configured: kubectl config current-context
-#   - To switch cluster: kubectl config use-context <context-name>
-#   - To list contexts: kubectl config get-contexts
-#   - To set namespace: kubectl config set-context --current --namespace=<ns>
-#   - Verify access: kubectl get secrets -n <namespace>
+#   - Check current context : kubectl config current-context
+#   - List contexts         : kubectl config get-contexts
+#   - Switch context        : kubectl config use-context <context-name>
+#   - Verify access         : kubectl get secrets -n <namespace>
 #
 # Add to .gitignore:
 #   cluster-kv-audit-*.log
@@ -31,11 +30,17 @@ import sys
 import os
 import re
 import json
+import base64
 import hashlib
+import tempfile
+import platform
 import subprocess
 import argparse
 from datetime import datetime
 from pathlib import Path
+
+# ─── Platform-aware az command ────────────────────────────────────────────────
+AZ_CMD = "az.cmd" if platform.system() == "Windows" else "az"
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
 RED   = '\033[0;31m'
@@ -46,13 +51,12 @@ BOLD  = '\033[1m'
 DIM   = '\033[2m'
 RST   = '\033[0m'
 
-def phase(msg):   print(f"\n{BOLD}{CYN}══ {msg} ══{RST}")
-def ok(msg):      print(f"  {GRN}✔{RST}  {msg}")
-def skip(msg):    print(f"  {DIM}–{RST}  {msg}")
-def err(msg):     print(f"  {RED}✘{RST}  {msg}", file=sys.stderr)
-def info(msg):    print(f"  {DIM}→{RST}  {msg}")
-def warn(msg):    print(f"  {YEL}⚠{RST}  {msg}")
-def bold(msg):    print(f"  {BOLD}{msg}{RST}")
+def phase(msg): print(f"\n{BOLD}{CYN}══ {msg} ══{RST}")
+def ok(msg):    print(f"  {GRN}✔{RST}  {msg}")
+def skip(msg):  print(f"  {DIM}–{RST}  {msg} {DIM}(skipped){RST}")
+def err(msg):   print(f"  {RED}✘{RST}  {msg}", file=sys.stderr)
+def info(msg):  print(f"  {DIM}→{RST}  {msg}")
+def warn(msg):  print(f"  {YEL}⚠{RST}  {msg}")
 
 # ─── Log setup ────────────────────────────────────────────────────────────────
 LOG_FILE = None
@@ -62,17 +66,15 @@ def setup_log():
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = Path(__file__).parent / f"cluster-kv-audit-{ts}.log"
     LOG_FILE = open(log_path, 'w', encoding='utf-8')
-    log(f"cluster-to-kv.py audit log — {datetime.now().isoformat()}")
+    log(f"cluster-to-kv.py — {datetime.now().isoformat()}")
     log("=" * 80)
     print(f"\n  {DIM}Log file: {log_path}{RST}")
     return log_path
 
-def log(msg, also_print=False):
+def log(msg):
     if LOG_FILE:
         LOG_FILE.write(msg + "\n")
         LOG_FILE.flush()
-    if also_print:
-        print(msg)
 
 def log_section(title):
     log("")
@@ -80,69 +82,92 @@ def log_section(title):
     log(f"  {title}")
     log("─" * 60)
 
-# ─── Shell helpers ────────────────────────────────────────────────────────────
-def run(cmd, capture=True, check=False):
-    result = subprocess.run(
-        cmd, capture_output=capture, text=True
-    )
-    return result
+# ─── Shell helper ─────────────────────────────────────────────────────────────
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 def safe_hash(value):
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
+# ─── System secret detection ──────────────────────────────────────────────────
+SKIP_TYPES = {
+    "kubernetes.io/service-account-token",
+    "kubernetes.io/dockerconfigjson",
+    "kubernetes.io/dockercfg",
+    "helm.sh/release.v1",
+    "bootstrap.kubernetes.io/token",
+}
+
+SKIP_NAME_PATTERNS = [
+    r'^sh\.helm\.release',
+    r'-token-[a-z0-9]+$',
+    r'^secrets-store-creds$',
+    r'^flux-acr-password$',
+    r'^default-token',
+]
+
+def is_system_secret(name, secret_type):
+    if secret_type in SKIP_TYPES:
+        return True
+    for pattern in SKIP_NAME_PATTERNS:
+        if re.search(pattern, name):
+            return True
+    return False
+
 # ─── kubectl helpers ──────────────────────────────────────────────────────────
-def get_namespaces():
-    result = run(["kubectl", "get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"])
+def get_current_context():
+    result = run(["kubectl", "config", "current-context"])
     if result.returncode != 0:
-        err("Failed to list namespaces. Is kubectl configured?")
+        err("Failed to get kubectl context. Is kubectl configured?")
+        sys.exit(1)
+    return result.stdout.strip()
+
+def get_namespaces():
+    result = run(["kubectl", "get", "namespaces",
+                  "-o", "jsonpath={.items[*].metadata.name}"])
+    if result.returncode != 0:
+        err("Failed to list namespaces.")
         err(result.stderr)
         sys.exit(1)
     return result.stdout.strip().split()
 
-def get_cluster_secret_value(secret_name, namespace):
-    """Fetch a secret value from the cluster. Returns (value, error)."""
-    result = run([
-        "kubectl", "get", "secret", secret_name,
-        "-n", namespace,
-        "-o", f"jsonpath={{.data.{secret_name}}}"
-    ])
+def get_secrets_in_namespace(namespace):
+    result = run(["kubectl", "get", "secrets",
+                  "-n", namespace, "-o", "json"])
     if result.returncode != 0:
-        # Try with the key being the same as secret name
-        result2 = run([
-            "kubectl", "get", "secret", secret_name,
-            "-n", namespace,
-            "-o", "json"
-        ])
-        if result2.returncode != 0:
-            return None, f"Secret not found in cluster: {secret_name} in {namespace}"
+        err(f"Failed to list secrets in {namespace}: {result.stderr}")
+        return []
 
-        try:
-            data = json.loads(result2.stdout)
-            secret_data = data.get("data", {})
-            if not secret_data:
-                return None, f"Secret exists but has no data: {secret_name}"
-
-            # Try first key value
-            import base64
-            first_key = list(secret_data.keys())[0]
-            value = base64.b64decode(secret_data[first_key]).decode('utf-8')
-            return value, None
-        except Exception as e:
-            return None, str(e)
-
-    if not result.stdout.strip():
-        return None, f"Empty value for {secret_name}"
-
-    import base64
     try:
-        value = base64.b64decode(result.stdout.strip()).decode('utf-8')
-        return value, None
-    except Exception as e:
-        return None, f"Failed to decode: {e}"
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        err(f"Failed to parse kubectl output for {namespace}")
+        return []
 
-def secret_exists_in_cluster(secret_name, namespace):
-    result = run(["kubectl", "get", "secret", secret_name, "-n", namespace])
-    return result.returncode == 0
+    secrets = []
+    for item in data.get("items", []):
+        name        = item["metadata"]["name"]
+        secret_type = item.get("type", "Opaque")
+        raw_data    = item.get("data", {})
+
+        if is_system_secret(name, secret_type):
+            continue
+
+        secrets.append({
+            "name":     name,
+            "type":     secret_type,
+            "keys":     list(raw_data.keys()),
+            "raw_data": raw_data,
+            "namespace": namespace,
+        })
+
+    return secrets
+
+def decode_secret_value(b64_value):
+    try:
+        return base64.b64decode(b64_value).decode('utf-8')
+    except Exception:
+        return None
 
 # ─── KV helpers ───────────────────────────────────────────────────────────────
 kv_cache = {}
@@ -150,12 +175,10 @@ kv_cache = {}
 def kv_secret_exists(vault, name):
     if name in kv_cache:
         return kv_cache[name]['exists']
-    result = run([
-        "az", "keyvault", "secret", "show",
-        "--vault-name", vault,
-        "--name", name,
-        "--query", "value", "-o", "tsv"
-    ])
+    result = run([AZ_CMD, "keyvault", "secret", "show",
+                  "--vault-name", vault,
+                  "--name", name,
+                  "--query", "value", "-o", "tsv"])
     exists = result.returncode == 0
     kv_cache[name] = {
         'exists': exists,
@@ -166,123 +189,79 @@ def kv_secret_exists(vault, name):
 def kv_get_value(vault, name):
     if name in kv_cache and kv_cache[name]['exists']:
         return kv_cache[name]['value']
-    result = run([
-        "az", "keyvault", "secret", "show",
-        "--vault-name", vault,
-        "--name", name,
-        "--query", "value", "-o", "tsv"
-    ])
+    result = run([AZ_CMD, "keyvault", "secret", "show",
+                  "--vault-name", vault,
+                  "--name", name,
+                  "--query", "value", "-o", "tsv"])
     if result.returncode == 0:
         return result.stdout.strip()
     return None
 
 def kv_set_value(vault, name, value):
-    """Upload value to KV using file to handle values starting with -"""
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                     delete=False, encoding='utf-8') as tmp:
         tmp.write(value)
         tmp_path = tmp.name
     try:
-        result = run([
-            "az", "keyvault", "secret", "set",
-            "--vault-name", vault,
-            "--name", name,
-            "--file", tmp_path,
-            "--output", "none"
-        ])
+        result = run([AZ_CMD, "keyvault", "secret", "set",
+                      "--vault-name", vault,
+                      "--name", name,
+                      "--file", tmp_path,
+                      "--output", "none"])
         return result.returncode == 0, result.stderr
     finally:
         os.unlink(tmp_path)
 
 def kv_get_metadata(vault, name):
-    result = run([
-        "az", "keyvault", "secret", "show",
-        "--vault-name", vault,
-        "--name", name,
-        "--query", "{id:id,created:attributes.created,updated:attributes.updated,enabled:attributes.enabled}",
-        "-o", "json"
-    ])
+    result = run([AZ_CMD, "keyvault", "secret", "show",
+                  "--vault-name", vault, "--name", name,
+                  "--query",
+                  "{id:id,created:attributes.created,updated:attributes.updated}",
+                  "-o", "json"])
     if result.returncode == 0:
         try:
             return json.loads(result.stdout)
-        except:
+        except Exception:
             return {}
     return {}
 
-# ─── SPC parsing ──────────────────────────────────────────────────────────────
-def get_spc_secrets(spc_path):
-    """
-    Extract (secretName, objectName, namespace) from SPC secretObjects.
-    Returns list of dicts.
-    """
-    with open(spc_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    # Get namespace from metadata
-    ns_match = re.search(r'^\s+namespace:\s+(\S+)', content, re.MULTILINE)
-    namespace = ns_match.group(1) if ns_match else None
-
-    secrets = []
-    # Match secretObjects entries
-    # Pattern: secretName: X ... data: ... key: Y ... objectName: Z
-    entries = re.finditer(
-        r'- secretName:\s+(\S+)\s+type:\s+\S+\s+data:\s*\n(?:\s+.*\n)*?\s+objectName:\s+(\S+)',
-        content
-    )
-    for m in entries:
-        secret_name = m.group(1).strip()
-        object_name = m.group(2).strip()
-        secrets.append({
-            'secretName': secret_name,
-            'objectName': object_name,
-            'namespace': namespace
-        })
-
-    return secrets, namespace
-
 # ─── Visual comparison ────────────────────────────────────────────────────────
-def show_comparison(secret_name, cluster_val, kv_val):
-    print(f"\n  {BOLD}Visual comparison: {secret_name}{RST}")
-    print(f"  {'─' * 60}")
+def show_comparison(name, cluster_val, kv_val):
+    print(f"\n  {BOLD}{'─' * 60}{RST}")
+    print(f"  {BOLD}Secret       :{RST} {name}")
+    print(f"  {BOLD}Cluster value:{RST} {cluster_val}")
+    print(f"  {BOLD}KV value     :{RST} {kv_val if kv_val else '[NOT IN KV]'}")
 
-    cluster_hash = safe_hash(cluster_val) if cluster_val else "N/A"
-    kv_hash      = safe_hash(kv_val)      if kv_val      else "N/A"
+    c_hash = safe_hash(cluster_val) if cluster_val else "N/A"
+    k_hash = safe_hash(kv_val)      if kv_val      else "N/A"
 
-    match = cluster_hash == kv_hash
+    print(f"  {BOLD}Cluster hash :{RST} {c_hash[:32]}…")
+    print(f"  {BOLD}KV hash      :{RST} {k_hash[:32]}…")
 
-    print(f"  {BOLD}Cluster value :{RST} {cluster_val}")
-    print(f"  {BOLD}KV value      :{RST} {kv_val if kv_val else '[NOT IN KV]'}")
-    print(f"  {BOLD}Cluster hash  :{RST} {cluster_hash[:24]}…")
-    print(f"  {BOLD}KV hash       :{RST} {kv_hash[:24]}…")
-
-    if match:
-        print(f"  {GRN}✔ Values match{RST}")
-    else:
-        print(f"  {RED}✘ Values DO NOT match{RST}")
-
-    print(f"  {'─' * 60}")
+    match = c_hash == k_hash
+    print(f"  {GRN}✔ Match{RST}" if match else f"  {RED}✘ Mismatch{RST}")
+    print(f"  {BOLD}{'─' * 60}{RST}")
     return match
 
 # ─── Prompt helpers ───────────────────────────────────────────────────────────
-def ask(prompt, options=None):
-    """Ask user a question. options like ['y','n','s']"""
-    opts = f" [{'/'.join(options)}]" if options else ""
+def ask(prompt, options):
+    opts = f" [{'/'.join(options)}]"
     while True:
         answer = input(f"\n  {YEL}?{RST}  {prompt}{opts}: ").strip().lower()
-        if options is None or answer in options:
+        if answer in options:
             return answer
         print(f"  Please enter one of: {', '.join(options)}")
 
 def ask_namespace(all_namespaces):
     print(f"\n  {BOLD}Available namespaces:{RST}")
     for i, ns in enumerate(all_namespaces, 1):
-        print(f"    {i}. {ns}")
-    print(f"    0. All namespaces")
+        print(f"    {i:3}. {ns}")
+    print(f"      0. All namespaces")
 
     while True:
-        choice = input(f"\n  {YEL}?{RST}  Enter namespace number or name: ").strip()
+        choice = input(f"\n  {YEL}?{RST}  Enter number or namespace name: ").strip()
         if choice == '0':
-            return None  # all
+            return None
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(all_namespaces):
@@ -290,165 +269,180 @@ def ask_namespace(all_namespaces):
         except ValueError:
             if choice in all_namespaces:
                 return [choice]
-        print("  Invalid choice. Try again.")
+        print("  Invalid. Try again.")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description='Reconcile cluster secrets with Azure KV')
+    parser = argparse.ArgumentParser(
+        description='Reconcile Kubernetes secrets with Azure Key Vault'
+    )
     parser.add_argument('--vault', required=True, help='Azure Key Vault name')
-    parser.add_argument('--dry-run', action='store_true', help='Print what would happen, make no changes')
-    parser.add_argument('--base-dir', default=None, help='Path to apps/base directory (default: auto-detect)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would happen — make no changes')
     args = parser.parse_args()
 
-    vault = args.vault
+    vault   = args.vault
     dry_run = args.dry_run
 
-    # Setup log
     log_path = setup_log()
-    log(f"Vault    : {vault}")
-    log(f"Dry run  : {dry_run}")
+    log(f"Vault   : {vault}")
+    log(f"Dry run : {dry_run}")
 
     if dry_run:
-        print(f"\n  {YEL}{BOLD}DRY RUN MODE — no changes will be made{RST}")
+        print(f"\n  {YEL}{BOLD}DRY RUN — no changes will be made{RST}")
 
-    # Resolve base dir
-    if args.base_dir:
-        base_dir = Path(args.base_dir)
-    else:
-        script_dir = Path(__file__).parent.resolve()
-        base_dir = script_dir / "apps" / "base"
+    # ── Step 1: Confirm kubectl context ───────────────────────────────────────
+    phase("Step 1 — kubectl context")
+    context = get_current_context()
+    print(f"\n  {BOLD}Current context:{RST} {CYN}{context}{RST}")
+    log(f"kubectl context: {context}")
 
-    if not base_dir.exists():
-        err(f"Base dir not found: {base_dir}")
-        err("Use --base-dir to specify the path to apps/base")
-        sys.exit(1)
+    confirm = ask("Is this the correct cluster?", ['y', 'n'])
+    if confirm == 'n':
+        print("\n  Run: kubectl config use-context <context-name>")
+        print("  List contexts: kubectl config get-contexts")
+        sys.exit(0)
 
-    # ── Step 1: Namespace selection ────────────────────────────────────────────
-    phase("Step 1 — Select namespace(s)")
+    # ── Step 2: Namespace selection ───────────────────────────────────────────
+    phase("Step 2 — Select namespace(s)")
     all_namespaces = get_namespaces()
     selected = ask_namespace(all_namespaces)
     target_namespaces = selected if selected else all_namespaces
-    log(f"Target namespaces: {target_namespaces}")
+    log(f"Namespaces: {target_namespaces}")
     info(f"Scanning: {', '.join(target_namespaces) if selected else 'ALL namespaces'}")
 
-    # ── Step 2: Discover SPC files ─────────────────────────────────────────────
-    phase("Step 2 — Discovering SPC files")
+    # ── Step 3: Collect secrets from cluster ──────────────────────────────────
+    phase("Step 3 — Collecting secrets from cluster")
 
-    all_spc_secrets = []  # list of (svc, secret_dict)
+    all_entries = []
 
-    svc_dirs = sorted([d for d in base_dir.iterdir() if d.is_dir()])
-    for svc_dir in svc_dirs:
-        spc_path = svc_dir / "secretproviderclass.yaml"
-        if not spc_path.exists():
-            continue
-        secrets, namespace = get_spc_secrets(spc_path)
-        if not secrets:
-            continue
-        if namespace not in target_namespaces:
-            continue
-        for s in secrets:
-            all_spc_secrets.append((svc_dir.name, s))
+    for ns in target_namespaces:
+        info(f"Scanning namespace: {ns}")
+        secrets = get_secrets_in_namespace(ns)
+        skipped_count = 0
 
-    info(f"Found {len(all_spc_secrets)} secret references across {len(set(s for s, _ in all_spc_secrets))} services")
-    log(f"Total SPC secret references: {len(all_spc_secrets)}")
+        ns_result = run(["kubectl", "get", "secrets", "-n", ns, "-o", "json"])
+        try:
+            ns_data = json.loads(ns_result.stdout)
+            total_in_ns = len(ns_data.get("items", []))
+            skipped_count = total_in_ns - len(secrets)
+        except Exception:
+            pass
 
-    # ── Step 3: Check each secret ──────────────────────────────────────────────
-    phase("Step 3 — Checking secrets")
+        info(f"  Found {len(secrets)} app secret(s), skipped {skipped_count} system secret(s)")
 
-    missing_in_kv = []      # (svc, secret_dict, cluster_value)
-    mismatch = []           # (svc, secret_dict, cluster_value, kv_value)
-    matched = []            # (svc, secret_dict)
-    not_in_cluster = []     # (svc, secret_dict)
-    errors = []             # (svc, secret_dict, error_msg)
+        for secret in secrets:
+            for key in secret['keys']:
+                raw_val = secret['raw_data'].get(key, '')
+                decoded = decode_secret_value(raw_val) if raw_val else None
+                all_entries.append({
+                    'namespace':     ns,
+                    'secret_name':   secret['name'],
+                    'key':           key,
+                    'cluster_value': decoded,
+                    'kv_name':       key,
+                })
 
-    total = len(all_spc_secrets)
-    for i, (svc, s) in enumerate(all_spc_secrets, 1):
-        secret_name = s['secretName']
-        object_name = s['objectName']
-        namespace   = s['namespace']
+    info(f"Total secret keys to check: {len(all_entries)}")
+    log(f"Total entries: {len(all_entries)}")
 
-        print(f"\n  {BOLD}[{i}/{total}]{RST} {secret_name}")
-        log_section(f"[{i}/{total}] {secret_name} (svc: {svc}, ns: {namespace})")
+    if not all_entries:
+        warn("No secrets found to check.")
+        LOG_FILE.close()
+        return
 
-        # Get cluster value
-        cluster_val, cluster_err = get_cluster_secret_value(secret_name, namespace)
+    # ── Step 4: Check each against KV ────────────────────────────────────────
+    phase("Step 4 — Checking against Key Vault")
 
-        if cluster_err:
-            warn(f"Not in cluster: {cluster_err}")
-            log(f"  STATUS : NOT IN CLUSTER")
-            log(f"  ERROR  : {cluster_err}")
-            not_in_cluster.append((svc, s, cluster_err))
+    missing_in_kv = []
+    mismatched    = []
+    matched       = []
+    decode_errors = []
+
+    total = len(all_entries)
+
+    for i, entry in enumerate(all_entries, 1):
+        ns          = entry['namespace']
+        secret_name = entry['secret_name']
+        key         = entry['key']
+        kv_name     = entry['kv_name']
+        cluster_val = entry['cluster_value']
+
+        print(f"\n  {BOLD}[{i}/{total}]{RST} {kv_name}  {DIM}(ns: {ns}){RST}")
+
+        log_section(f"[{i}/{total}] {kv_name}")
+        log(f"  Namespace   : {ns}")
+        log(f"  Secret name : {secret_name}")
+        log(f"  Key         : {key}")
+
+        if cluster_val is None:
+            warn("Could not decode cluster value — skipping")
+            log(f"  STATUS: DECODE ERROR")
+            decode_errors.append(entry)
             continue
 
         log(f"  CLUSTER VALUE : {cluster_val}")
         log(f"  CLUSTER HASH  : {safe_hash(cluster_val)}")
 
-        # Check KV
-        kv_exists = kv_secret_exists(vault, object_name)
+        exists = kv_secret_exists(vault, kv_name)
 
-        if not kv_exists:
-            warn(f"NOT in KV: {object_name}")
-            log(f"  STATUS : MISSING FROM KV")
-            log(f"  KV NAME: {object_name}")
-            missing_in_kv.append((svc, s, cluster_val))
+        if not exists:
+            warn(f"NOT in KV")
+            log(f"  STATUS: MISSING FROM KV")
+            missing_in_kv.append(entry)
             continue
 
-        # Both exist — compare
-        kv_val = kv_get_value(vault, object_name)
+        kv_val = kv_get_value(vault, kv_name)
         log(f"  KV VALUE      : {kv_val}")
         log(f"  KV HASH       : {safe_hash(kv_val) if kv_val else 'N/A'}")
 
-        match = show_comparison(object_name, cluster_val, kv_val)
+        match = show_comparison(kv_name, cluster_val, kv_val)
 
         if match:
-            ok(f"Match: {object_name}")
-            log(f"  STATUS : MATCH")
-            matched.append((svc, s))
+            log(f"  STATUS: MATCH")
+            matched.append(entry)
         else:
-            warn(f"MISMATCH: {object_name}")
-            log(f"  STATUS : MISMATCH")
-            mismatch.append((svc, s, cluster_val, kv_val))
+            log(f"  STATUS: MISMATCH")
+            mismatched.append({**entry, 'kv_value': kv_val})
 
-    # ── Step 4: Summary of findings ────────────────────────────────────────────
-    phase("Step 4 — Findings summary")
+    # ── Step 5: Summary ───────────────────────────────────────────────────────
+    phase("Step 5 — Summary")
 
     print(f"""
   {GRN}Matched (cluster = KV){RST}    : {len(matched)}
   {YEL}Missing from KV{RST}          : {len(missing_in_kv)}
-  {YEL}Mismatch (values differ){RST} : {len(mismatch)}
-  {DIM}Not in cluster{RST}           : {len(not_in_cluster)}
-  {RED}Errors{RST}                   : {len(errors)}
+  {YEL}Mismatch (values differ){RST} : {len(mismatched)}
+  {DIM}Decode errors (skipped){RST}  : {len(decode_errors)}
 """)
 
     log_section("SUMMARY")
-    log(f"  Matched          : {len(matched)}")
-    log(f"  Missing from KV  : {len(missing_in_kv)}")
-    log(f"  Mismatch         : {len(mismatch)}")
-    log(f"  Not in cluster   : {len(not_in_cluster)}")
+    log(f"  Matched        : {len(matched)}")
+    log(f"  Missing from KV: {len(missing_in_kv)}")
+    log(f"  Mismatch       : {len(mismatched)}")
+    log(f"  Decode errors  : {len(decode_errors)}")
 
     if missing_in_kv:
+        print(f"\n  {BOLD}Missing from KV:{RST}")
         log_section("MISSING FROM KV")
-        print(f"\n  {BOLD}Secrets missing from KV:{RST}")
-        for svc, s, cluster_val in missing_in_kv:
-            print(f"    {RED}✘{RST} {s['objectName']}")
-            print(f"      {DIM}Service: {svc} | Namespace: {s['namespace']}{RST}")
-            log(f"  {s['objectName']} | cluster value: {cluster_val}")
+        for e in missing_in_kv:
+            print(f"    {RED}✘{RST} {e['kv_name']}  {DIM}(ns: {e['namespace']}){RST}")
+            log(f"  {e['kv_name']} | ns: {e['namespace']} | cluster value: {e['cluster_value']}")
 
-    if mismatch:
+    if mismatched:
+        print(f"\n  {BOLD}Mismatched:{RST}")
         log_section("MISMATCHES")
-        print(f"\n  {BOLD}Secrets with mismatched values:{RST}")
-        for svc, s, cluster_val, kv_val in mismatch:
-            print(f"    {YEL}≠{RST} {s['objectName']}")
-            log(f"  {s['objectName']} | cluster: {cluster_val} | kv: {kv_val}")
+        for e in mismatched:
+            print(f"    {YEL}≠{RST} {e['kv_name']}  {DIM}(ns: {e['namespace']}){RST}")
+            log(f"  {e['kv_name']} | cluster: {e['cluster_value']} | kv: {e['kv_value']}")
 
     if dry_run:
         print(f"\n  {YEL}Dry run — stopping here. No changes made.{RST}\n")
         LOG_FILE.close()
         return
 
-    # ── Step 5: Handle missing secrets ─────────────────────────────────────────
+    # ── Step 6: Upload missing secrets ────────────────────────────────────────
     if missing_in_kv:
-        phase("Step 5 — Upload missing secrets to KV")
+        phase("Step 6 — Upload missing secrets to KV")
 
         answer = ask(
             f"Upload {len(missing_in_kv)} missing secret(s) to KV?",
@@ -456,101 +450,100 @@ def main():
         )
 
         if answer == 'y':
-            for svc, s, cluster_val in missing_in_kv:
-                object_name = s['objectName']
-                print(f"\n  {BOLD}{object_name}{RST}")
+            for entry in missing_in_kv:
+                kv_name     = entry['kv_name']
+                cluster_val = entry['cluster_value']
+
+                print(f"\n  {BOLD}{kv_name}{RST}")
                 info(f"Cluster value : {cluster_val}")
-                info(f"Cluster hash  : {safe_hash(cluster_val)[:24]}…")
+                info(f"Cluster hash  : {safe_hash(cluster_val)[:32]}…")
 
-                confirm = ask(f"Upload this secret to KV?", ['y', 'n', 's'])
-                if confirm == 'n':
-                    warn("Skipped by user")
-                    log(f"  UPLOAD SKIPPED (user): {object_name}")
+                confirm = ask("Upload this secret?", ['y', 'skip', 'pause'])
+                if confirm == 'skip':
+                    warn("Skipped")
+                    log(f"  UPLOAD SKIPPED: {kv_name}")
                     continue
-                if confirm == 's':
-                    warn("Skipped — will handle manually")
-                    log(f"  UPLOAD SKIPPED (manual later): {object_name}")
+                if confirm == 'pause':
+                    input("  Paused. Press Enter to continue...")
+                    log(f"  UPLOAD PAUSED: {kv_name}")
                     continue
 
-                # Upload
-                success, upload_err = kv_set_value(vault, object_name, cluster_val)
+                success, upload_err = kv_set_value(vault, kv_name, cluster_val)
 
                 if not success:
                     err(f"Upload failed: {upload_err}")
-                    log(f"  UPLOAD FAILED: {object_name} | error: {upload_err}")
-                    pause = ask("Upload failed. Pause script or skip?", ['pause', 'skip'])
-                    if pause == 'pause':
-                        input("  Script paused. Press Enter to continue...")
+                    log(f"  UPLOAD FAILED: {kv_name} | error: {upload_err}")
+                    action = ask("Upload failed. Pause or skip?", ['pause', 'skip'])
+                    if action == 'pause':
+                        input("  Paused. Press Enter to continue...")
                     continue
 
-                # Verify
-                info("Verifying upload…")
-                kv_cache.pop(object_name, None)  # clear cache
-                kv_val_after = kv_get_value(vault, object_name)
-
-                match = show_comparison(object_name, cluster_val, kv_val_after)
+                info("Verifying…")
+                kv_cache.pop(kv_name, None)
+                kv_val_after = kv_get_value(vault, kv_name)
+                match = show_comparison(kv_name, cluster_val, kv_val_after)
 
                 if match:
-                    ok(f"Uploaded and verified: {object_name}")
-                    meta = kv_get_metadata(vault, object_name)
+                    meta    = kv_get_metadata(vault, kv_name)
                     version = meta.get('id', '').split('/')[-1] if meta else 'unknown'
-                    info(f"KV version : {version}")
-                    log(f"  UPLOADED OK: {object_name} | version: {version} | value: {cluster_val}")
+                    ok(f"Uploaded and verified")
+                    info(f"KV version: {version}")
+                    log(f"  UPLOADED OK: {kv_name} | version: {version} | value: {cluster_val}")
                 else:
-                    err(f"Checksum mismatch after upload!")
-                    log(f"  UPLOAD MISMATCH: {object_name} | cluster: {cluster_val} | kv_after: {kv_val_after}")
-                    action = ask(
-                        "Value mismatch after upload. Retry, skip, or pause?",
-                        ['retry', 'skip', 'pause']
-                    )
+                    err("Checksum mismatch after upload!")
+                    log(f"  UPLOAD MISMATCH: {kv_name}")
+                    action = ask("Mismatch after upload. Retry, skip, or pause?",
+                                 ['retry', 'skip', 'pause'])
                     if action == 'retry':
-                        kv_set_value(vault, object_name, cluster_val)
+                        kv_set_value(vault, kv_name, cluster_val)
                         ok("Retried — check logs")
+                        log(f"  RETRIED: {kv_name}")
                     elif action == 'pause':
-                        input("  Script paused. Press Enter to continue...")
+                        input("  Paused. Press Enter to continue...")
 
-    # ── Step 6: Handle mismatches ──────────────────────────────────────────────
-    if mismatch:
-        phase("Step 6 — Handle mismatched secrets")
-        warn("The following secrets exist in both cluster and KV but values differ.")
-        warn("Cluster is source of truth — uploading cluster value will overwrite KV.")
+    # ── Step 7: Handle mismatches ─────────────────────────────────────────────
+    if mismatched:
+        phase("Step 7 — Handle mismatched secrets")
+        warn("These secrets exist in both cluster and KV but values differ.")
+        warn("Cluster is source of truth.")
 
-        for svc, s, cluster_val, kv_val in mismatch:
-            object_name = s['objectName']
-            print(f"\n  {BOLD}{object_name}{RST}")
-            show_comparison(object_name, cluster_val, kv_val)
+        for entry in mismatched:
+            kv_name     = entry['kv_name']
+            cluster_val = entry['cluster_value']
+            kv_val      = entry['kv_value']
 
-            action = ask(
-                "Overwrite KV with cluster value, skip, or pause?",
-                ['overwrite', 'skip', 'pause']
-            )
+            print(f"\n  {BOLD}{kv_name}{RST}")
+            show_comparison(kv_name, cluster_val, kv_val)
+
+            action = ask("Overwrite KV with cluster value, skip, or pause?",
+                         ['overwrite', 'skip', 'pause'])
 
             if action == 'skip':
-                log(f"  MISMATCH SKIPPED: {object_name}")
+                log(f"  MISMATCH SKIPPED: {kv_name}")
                 continue
             if action == 'pause':
-                input("  Script paused. Press Enter to continue...")
-                log(f"  MISMATCH PAUSED: {object_name}")
+                input("  Paused. Press Enter to continue...")
+                log(f"  MISMATCH PAUSED: {kv_name}")
                 continue
 
-            success, upload_err = kv_set_value(vault, object_name, cluster_val)
+            success, upload_err = kv_set_value(vault, kv_name, cluster_val)
             if not success:
                 err(f"Upload failed: {upload_err}")
-                log(f"  OVERWRITE FAILED: {object_name} | error: {upload_err}")
+                log(f"  OVERWRITE FAILED: {kv_name} | error: {upload_err}")
                 continue
 
-            kv_cache.pop(object_name, None)
-            kv_val_after = kv_get_value(vault, object_name)
-            match = show_comparison(object_name, cluster_val, kv_val_after)
+            kv_cache.pop(kv_name, None)
+            kv_val_after = kv_get_value(vault, kv_name)
+            match = show_comparison(kv_name, cluster_val, kv_val_after)
 
             if match:
-                ok(f"Overwritten and verified: {object_name}")
-                log(f"  OVERWRITTEN OK: {object_name} | value: {cluster_val}")
+                ok("Overwritten and verified")
+                log(f"  OVERWRITTEN OK: {kv_name} | value: {cluster_val}")
             else:
-                err(f"Still mismatched after overwrite!")
-                log(f"  OVERWRITE MISMATCH: {object_name}")
+                err("Still mismatched after overwrite!")
+                log(f"  OVERWRITE MISMATCH: {kv_name}")
 
-    # ── Final summary ──────────────────────────────────────────────────────────
+    # ── Done ──────────────────────────────────────────────────────────────────
     phase("Done")
     print(f"  {GRN}{BOLD}Reconciliation complete.{RST}")
     print(f"  {DIM}Full log: {log_path}{RST}\n")
