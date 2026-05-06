@@ -12,13 +12,19 @@
 # Usage:
 #   ./cluster-to-kv.sh --vault ncba-core-test-kv [--dry-run]
 #
-# kubectl setup notes:
-#   - Check current context : kubectl config current-context
-#   - List contexts         : kubectl config get-contexts
-#   - Switch context        : kubectl config use-context <context-name>
+# First time setup (run once before using this script):
+#   az login --use-device-code
+#   az account set --subscription <your-subscription-id>
+#   az account show   # confirm correct subscription
+#
+# kubectl setup:
+#   kubectl config current-context       # check current cluster
+#   kubectl config get-contexts          # list all contexts
+#   kubectl config use-context <name>    # switch cluster
 #
 # Add to .gitignore:
 #   cluster-kv-audit-*.log
+#   .kv-cache-*.tmp
 # =============================================================================
 set -euo pipefail
 
@@ -45,9 +51,16 @@ warn()  { echo -e "  ${YEL}⚠${RST}  $1"; }
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/cluster-kv-audit-${TIMESTAMP}.log"
+KV_CACHE_FILE="${SCRIPT_DIR}/.kv-cache-${TIMESTAMP}.tmp"
 
 log() { echo "$1" >> "$LOG_FILE"; }
-log_section() { log ""; log "────────────────────────────────────"; log "  $1"; log "────────────────────────────────────"; }
+log_section() {
+  log ""; log "────────────────────────────────────"
+  log "  $1"; log "────────────────────────────────────"
+}
+
+# Cleanup temp cache on exit
+trap 'rm -f "$KV_CACHE_FILE"' EXIT
 
 # ─── Args ─────────────────────────────────────────────────────────────────────
 VAULT=""; DRY_RUN=false
@@ -72,6 +85,70 @@ log "========================================"
 log "Vault: $VAULT | Dry run: $DRY_RUN"
 echo -e "\n  ${DIM}Log: $LOG_FILE${RST}"
 [[ "$DRY_RUN" == true ]] && echo -e "\n  ${YEL}${BOLD}DRY RUN — no changes will be made${RST}"
+
+# ─── Step 0: Verify az login ONCE upfront ─────────────────────────────────────
+phase "Step 0 — Verifying Azure login"
+
+az_account=$($AZ account show --query "{name:name,id:id}" -o tsv 2>/dev/null || echo "")
+if [[ -z "$az_account" ]]; then
+  err "Not logged in to Azure. Run: az login --use-device-code"
+  err "Then: az account set --subscription <your-subscription-id>"
+  exit 1
+fi
+
+sub_name=$($AZ account show --query "name" -o tsv 2>/dev/null | tr -d '\r')
+sub_id=$($AZ account show --query "id" -o tsv 2>/dev/null | tr -d '\r')
+echo -e "\n  ${BOLD}Subscription:${RST} ${CYN}${sub_name}${RST}"
+echo -e "  ${BOLD}ID          :${RST} ${DIM}${sub_id}${RST}"
+log "Subscription: $sub_name ($sub_id)"
+
+read -rp "$(echo -e "\n  ${YEL}?${RST}  Is this the correct Azure subscription? [y/n]: ")" az_confirm
+[[ "$az_confirm" != "y" ]] && {
+  echo "  Run: az account set --subscription <subscription-id>"
+  echo "  List subscriptions: az account list --output table"
+  exit 0
+}
+
+# ─── Pre-fetch ALL secrets from KV into a local cache file ────────────────────
+# This is the key fix — one az call to list everything, then grep locally
+# instead of one az call per secret (which caused repeated auth prompts)
+phase "Pre-fetching KV secrets list"
+info "Fetching all secret names from KV — this runs once only…"
+
+$AZ keyvault secret list \
+  --vault-name "$VAULT" \
+  --query "[].name" \
+  -o tsv 2>/dev/null | tr -d '\r' | sort > "$KV_CACHE_FILE"
+
+kv_total=$(wc -l < "$KV_CACHE_FILE" | tr -d ' ')
+ok "Loaded $kv_total secret names from KV into local cache"
+log "KV secrets cached: $kv_total"
+
+# ─── KV helpers using local cache ─────────────────────────────────────────────
+# Check existence against local cache — no az call needed
+kv_exists_cached() {
+  grep -Fxq "$1" "$KV_CACHE_FILE" 2>/dev/null
+}
+
+# Only call az when we actually need the value (for comparison)
+kv_get() {
+  $AZ keyvault secret show --vault-name "$VAULT" --name "$1" \
+    --query "value" -o tsv 2>/dev/null | tr -d '\r'
+}
+
+kv_set() {
+  local name="$1" value="$2" tmp rc=0 out
+  tmp=$(mktemp)
+  printf '%s' "$value" > "$tmp"
+  out=$($AZ keyvault secret set --vault-name "$VAULT" \
+    --name "$name" --file "$tmp" --output none 2>&1) || rc=$?
+  rm -f "$tmp"; echo "$out"; return $rc
+}
+
+kv_version() {
+  $AZ keyvault secret show --vault-name "$VAULT" --name "$1" \
+    --query "id" -o tsv 2>/dev/null | rev | cut -d'/' -f1 | rev | tr -d '\r'
+}
 
 # ─── System secret filter ─────────────────────────────────────────────────────
 is_system_secret() {
@@ -120,38 +197,35 @@ show_comparison() {
   fi
 }
 
-# ─── KV helpers ───────────────────────────────────────────────────────────────
-kv_exists() { $AZ keyvault secret show --vault-name "$VAULT" --name "$1" --query "value" -o tsv &>/dev/null; }
-kv_get()    { $AZ keyvault secret show --vault-name "$VAULT" --name "$1" --query "value" -o tsv 2>/dev/null | tr -d '\r'; }
-kv_version(){ $AZ keyvault secret show --vault-name "$VAULT" --name "$1" --query "id" -o tsv 2>/dev/null | rev | cut -d'/' -f1 | rev | tr -d '\r'; }
-
-kv_set() {
-  local name="$1" value="$2" tmp rc=0 out
-  tmp=$(mktemp)
-  printf '%s' "$value" > "$tmp"
-  out=$($AZ keyvault secret set --vault-name "$VAULT" --name "$name" --file "$tmp" --output none 2>&1) || rc=$?
-  rm -f "$tmp"; echo "$out"; return $rc
-}
-
-# ─── Step 1: Context ──────────────────────────────────────────────────────────
+# ─── Step 1: kubectl context ──────────────────────────────────────────────────
 phase "Step 1 — kubectl context"
 
-CONTEXT=$(kubectl config current-context 2>/dev/null) || { err "kubectl not configured"; exit 1; }
+CONTEXT=$(kubectl config current-context 2>/dev/null) || {
+  err "kubectl not configured. Run: kubectl config use-context <name>"
+  exit 1
+}
 echo -e "\n  ${BOLD}Current context:${RST} ${CYN}${CONTEXT}${RST}"
 log "Context: $CONTEXT"
 
 read -rp "$(echo -e "\n  ${YEL}?${RST}  Is this the correct cluster? [y/n]: ")" confirm
-[[ "$confirm" != "y" ]] && { echo "  Run: kubectl config use-context <name>"; exit 0; }
+[[ "$confirm" != "y" ]] && {
+  echo "  Run: kubectl config use-context <name>"
+  echo "  List: kubectl config get-contexts"
+  exit 0
+}
 
-# ─── Step 2: Namespace ────────────────────────────────────────────────────────
+# ─── Step 2: Namespace selection ──────────────────────────────────────────────
 phase "Step 2 — Select namespace(s)"
 
 mapfile -t ALL_NS < <(
-  kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+  kubectl get namespaces \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
 )
 
 echo -e "\n  ${BOLD}Available namespaces:${RST}"
-for i in "${!ALL_NS[@]}"; do printf "    %3d. %s\n" "$((i+1))" "${ALL_NS[$i]}"; done
+for i in "${!ALL_NS[@]}"; do
+  printf "    %3d. %s\n" "$((i+1))" "${ALL_NS[$i]}"
+done
 echo "      0. All namespaces"
 
 TARGET_NS=()
@@ -188,7 +262,6 @@ ENTRY_NS=()
 for ns in "${TARGET_NS[@]}"; do
   info "Scanning namespace: $ns"
 
-  # Get all secret names and types — one kubectl call per namespace
   mapfile -t SECRET_LINES < <(
     kubectl get secrets -n "$ns" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.type}{"\n"}{end}' \
@@ -206,7 +279,7 @@ for ns in "${TARGET_NS[@]}"; do
     is_system_secret "$secret_name" "$secret_type" && continue
     ((app_count++)) || true
 
-    # Get all keys for this secret — go-template is most reliable for arbitrary key names
+    # Get key names using go-template
     mapfile -t KEY_LINES < <(
       kubectl get secret "$secret_name" -n "$ns" \
         -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}' \
@@ -218,14 +291,14 @@ for ns in "${TARGET_NS[@]}"; do
     for key in "${KEY_LINES[@]}"; do
       [[ -z "$key" ]] && continue
 
-      # Get b64 value for this key using jsonpath index notation
       b64val=$(kubectl get secret "$secret_name" -n "$ns" \
         -o jsonpath="{.data['${key}']}" 2>/dev/null | tr -d '\r\n' || echo "")
 
       if [[ -z "$b64val" ]]; then
         cluster_val=""
       else
-        cluster_val=$(printf '%s' "$b64val" | base64 --decode 2>/dev/null | tr -d '\r' || echo "")
+        cluster_val=$(printf '%s' "$b64val" | base64 --decode 2>/dev/null \
+          | tr -d '\r' || echo "")
       fi
 
       ENTRY_KV_NAME+=("$key")
@@ -242,11 +315,10 @@ total=${#ENTRY_KV_NAME[@]}
 info "Total keys to check: $total"
 log "Total entries: $total"
 
-if [[ "$total" -eq 0 ]]; then
-  warn "No secrets found."; exit 0
-fi
+[[ "$total" -eq 0 ]] && { warn "No secrets found."; exit 0; }
 
-# ─── Step 4: Check against KV ────────────────────────────────────────────────
+# ─── Step 4: Check against KV ─────────────────────────────────────────────────
+# Uses local cache for existence check — only calls az for value comparison
 phase "Step 4 — Checking against Key Vault"
 
 MISSING_NAMES=(); MISSING_VALUES=(); MISSING_NS=()
@@ -272,7 +344,8 @@ for i in "${!ENTRY_KV_NAME[@]}"; do
   log "  CLUSTER VALUE : $cluster_val"
   log "  CLUSTER HASH  : $(safe_hash "$cluster_val")"
 
-  if ! kv_exists "$kv_name"; then
+  # Existence check uses local cache — no az call
+  if ! kv_exists_cached "$kv_name"; then
     warn "NOT in KV"
     log "  STATUS: MISSING FROM KV"
     MISSING_NAMES+=("$kv_name")
@@ -281,6 +354,7 @@ for i in "${!ENTRY_KV_NAME[@]}"; do
     continue
   fi
 
+  # Value comparison requires az call — but only for secrets that exist
   kv_val=$(kv_get "$kv_name")
   log "  KV VALUE : $kv_val"
   log "  KV HASH  : $(safe_hash "$kv_val")"
@@ -371,6 +445,8 @@ if [[ ${#MISSING_NAMES[@]} -gt 0 ]]; then
         version=$(kv_version "$kv_name")
         ok "Uploaded and verified | version: $version"
         log "  UPLOADED OK: $kv_name | version: $version | value: $cluster_val"
+        # Add to cache so subsequent checks know it exists
+        echo "$kv_name" >> "$KV_CACHE_FILE"
       else
         err "Checksum mismatch after upload!"
         log "  UPLOAD MISMATCH: $kv_name"
@@ -387,7 +463,7 @@ fi
 # ─── Step 7: Handle mismatches ────────────────────────────────────────────────
 if [[ ${#MISMATCH_NAMES[@]} -gt 0 ]]; then
   phase "Step 7 — Handle mismatched secrets"
-  warn "Cluster is source of truth — overwrite will replace KV value."
+  warn "Cluster is source of truth — overwrite replaces KV value."
 
   for i in "${!MISMATCH_NAMES[@]}"; do
     kv_name="${MISMATCH_NAMES[$i]}"
@@ -412,7 +488,8 @@ if [[ ${#MISMATCH_NAMES[@]} -gt 0 ]]; then
 
     kv_val_after=$(kv_get "$kv_name")
     if show_comparison "$kv_name" "$cluster_val" "$kv_val_after"; then
-      ok "Overwritten and verified"; log "  OVERWRITTEN OK: $kv_name | value: $cluster_val"
+      ok "Overwritten and verified"
+      log "  OVERWRITTEN OK: $kv_name | value: $cluster_val"
     else
       err "Still mismatched!"; log "  OVERWRITE MISMATCH: $kv_name"
     fi
