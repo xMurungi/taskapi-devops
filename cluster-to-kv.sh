@@ -1,3 +1,6 @@
+# chmod +x cluster-to-kv.sh
+# ./cluster-to-kv.sh --vault ncba-core-test-kv --dry-run
+
 #!/usr/bin/env bash
 # =============================================================================
 # cluster-to-kv.sh
@@ -13,7 +16,6 @@
 #   - Check current context : kubectl config current-context
 #   - List contexts         : kubectl config get-contexts
 #   - Switch context        : kubectl config use-context <context-name>
-#   - Verify access         : kubectl get secrets -n <namespace>
 #
 # Add to .gitignore:
 #   cluster-kv-audit-*.log
@@ -26,8 +28,7 @@ if command -v az.cmd &>/dev/null; then
 elif command -v az &>/dev/null; then
   AZ="az"
 else
-  echo "Azure CLI (az) not found." >&2
-  exit 1
+  echo "Azure CLI (az) not found." >&2; exit 1
 fi
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
@@ -40,20 +41,16 @@ err()   { echo -e "  ${RED}✘${RST}  $1" >&2; }
 info()  { echo -e "  ${DIM}→${RST}  $1"; }
 warn()  { echo -e "  ${YEL}⚠${RST}  $1"; }
 
-# ─── Log setup ────────────────────────────────────────────────────────────────
+# ─── Log ──────────────────────────────────────────────────────────────────────
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/cluster-kv-audit-${TIMESTAMP}.log"
 
 log() { echo "$1" >> "$LOG_FILE"; }
-log_section() {
-  log ""; log "────────────────────────────────────────────────────────────"
-  log "  $1"; log "────────────────────────────────────────────────────────────"
-}
+log_section() { log ""; log "────────────────────────────────────"; log "  $1"; log "────────────────────────────────────"; }
 
 # ─── Args ─────────────────────────────────────────────────────────────────────
-VAULT=""
-DRY_RUN=false
+VAULT=""; DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -67,32 +64,26 @@ done
 
 # ─── Dependency check ─────────────────────────────────────────────────────────
 for cmd in kubectl base64; do
-  command -v "$cmd" &>/dev/null || { err "Required tool not found: $cmd"; exit 1; }
+  command -v "$cmd" &>/dev/null || { err "Required: $cmd not found"; exit 1; }
 done
 
-# ─── Init log ─────────────────────────────────────────────────────────────────
-log "cluster-to-kv.sh — $(date -Iseconds 2>/dev/null || date)"
-log "========================================================================"
-log "Vault   : $VAULT"
-log "Dry run : $DRY_RUN"
-echo -e "\n  ${DIM}Log file: $LOG_FILE${RST}"
+log "cluster-to-kv.sh — $(date)"
+log "========================================"
+log "Vault: $VAULT | Dry run: $DRY_RUN"
+echo -e "\n  ${DIM}Log: $LOG_FILE${RST}"
 [[ "$DRY_RUN" == true ]] && echo -e "\n  ${YEL}${BOLD}DRY RUN — no changes will be made${RST}"
 
-# ─── System secret types/names to skip ───────────────────────────────────────
+# ─── System secret filter ─────────────────────────────────────────────────────
 is_system_secret() {
   local name="$1" type="$2"
   case "$type" in
     kubernetes.io/service-account-token|\
-    kubernetes.io/dockerconfigjson|\
-    kubernetes.io/dockercfg|\
-    helm.sh/release.v1|\
-    bootstrap.kubernetes.io/token)
-      return 0 ;;
+    kubernetes.io/dockerconfigjson|kubernetes.io/dockercfg|\
+    helm.sh/release.v1|bootstrap.kubernetes.io/token) return 0 ;;
   esac
   case "$name" in
     secrets-store-creds|flux-acr-password|default-token*) return 0 ;;
   esac
-  # sh.helm.release prefix or *-token-* pattern
   [[ "$name" == sh.helm.release* ]] && return 0
   echo "$name" | grep -qE '\-token\-[a-z0-9]+$' && return 0
   return 1
@@ -109,112 +100,79 @@ safe_hash() {
 
 # ─── Visual comparison ────────────────────────────────────────────────────────
 show_comparison() {
-  local name="$1" cluster_val="$2" kv_val="$3"
-  local c_hash k_hash
-  c_hash=$(safe_hash "$cluster_val")
-  k_hash=$(safe_hash "$kv_val")
-
-  echo -e "\n  ${BOLD}────────────────────────────────────────────────────────────${RST}"
+  local name="$1" cv="$2" kv="$3"
+  local ch kh
+  ch=$(safe_hash "$cv"); kh=$(safe_hash "$kv")
+  echo -e "\n  ${BOLD}────────────────────────────────────${RST}"
   echo -e "  ${BOLD}Secret       :${RST} $name"
-  echo -e "  ${BOLD}Cluster value:${RST} $cluster_val"
-  echo -e "  ${BOLD}KV value     :${RST} ${kv_val:-[NOT IN KV]}"
-  echo -e "  ${BOLD}Cluster hash :${RST} ${c_hash:0:32}…"
-  echo -e "  ${BOLD}KV hash      :${RST} ${k_hash:0:32}…"
-
-  if [[ "$c_hash" == "$k_hash" ]]; then
+  echo -e "  ${BOLD}Cluster value:${RST} $cv"
+  echo -e "  ${BOLD}KV value     :${RST} ${kv:-[NOT IN KV]}"
+  echo -e "  ${BOLD}Cluster hash :${RST} ${ch:0:32}…"
+  echo -e "  ${BOLD}KV hash      :${RST} ${kh:0:32}…"
+  if [[ "$ch" == "$kh" ]]; then
     echo -e "  ${GRN}✔ Match${RST}"
-    echo -e "  ${BOLD}────────────────────────────────────────────────────────────${RST}"
+    echo -e "  ${BOLD}────────────────────────────────────${RST}"
     return 0
   else
     echo -e "  ${RED}✘ Mismatch${RST}"
-    echo -e "  ${BOLD}────────────────────────────────────────────────────────────${RST}"
+    echo -e "  ${BOLD}────────────────────────────────────${RST}"
     return 1
   fi
 }
 
 # ─── KV helpers ───────────────────────────────────────────────────────────────
-kv_exists() {
-  $AZ keyvault secret show --vault-name "$VAULT" --name "$1" \
-    --query "value" -o tsv &>/dev/null
-}
-
-kv_get() {
-  $AZ keyvault secret show --vault-name "$VAULT" --name "$1" \
-    --query "value" -o tsv 2>/dev/null | tr -d '\r'
-}
+kv_exists() { $AZ keyvault secret show --vault-name "$VAULT" --name "$1" --query "value" -o tsv &>/dev/null; }
+kv_get()    { $AZ keyvault secret show --vault-name "$VAULT" --name "$1" --query "value" -o tsv 2>/dev/null | tr -d '\r'; }
+kv_version(){ $AZ keyvault secret show --vault-name "$VAULT" --name "$1" --query "id" -o tsv 2>/dev/null | rev | cut -d'/' -f1 | rev | tr -d '\r'; }
 
 kv_set() {
-  local name="$1" value="$2" tmp
+  local name="$1" value="$2" tmp rc=0 out
   tmp=$(mktemp)
   printf '%s' "$value" > "$tmp"
-  local out rc=0
-  out=$($AZ keyvault secret set --vault-name "$VAULT" \
-    --name "$name" --file "$tmp" --output none 2>&1) || rc=$?
-  rm -f "$tmp"
-  echo "$out"
-  return $rc
+  out=$($AZ keyvault secret set --vault-name "$VAULT" --name "$name" --file "$tmp" --output none 2>&1) || rc=$?
+  rm -f "$tmp"; echo "$out"; return $rc
 }
 
-kv_version() {
-  $AZ keyvault secret show --vault-name "$VAULT" --name "$1" \
-    --query "id" -o tsv 2>/dev/null | rev | cut -d'/' -f1 | rev | tr -d '\r'
-}
-
-# ─── Step 1: kubectl context ──────────────────────────────────────────────────
+# ─── Step 1: Context ──────────────────────────────────────────────────────────
 phase "Step 1 — kubectl context"
 
-CONTEXT=$(kubectl config current-context 2>/dev/null) || {
-  err "Failed to get kubectl context. Is kubectl configured?"
-  exit 1
-}
-
+CONTEXT=$(kubectl config current-context 2>/dev/null) || { err "kubectl not configured"; exit 1; }
 echo -e "\n  ${BOLD}Current context:${RST} ${CYN}${CONTEXT}${RST}"
-log "kubectl context: $CONTEXT"
+log "Context: $CONTEXT"
 
 read -rp "$(echo -e "\n  ${YEL}?${RST}  Is this the correct cluster? [y/n]: ")" confirm
-[[ "$confirm" != "y" ]] && {
-  echo "  Run: kubectl config use-context <context-name>"
-  echo "  List contexts: kubectl config get-contexts"
-  exit 0
-}
+[[ "$confirm" != "y" ]] && { echo "  Run: kubectl config use-context <name>"; exit 0; }
 
-# ─── Step 2: Namespace selection ──────────────────────────────────────────────
+# ─── Step 2: Namespace ────────────────────────────────────────────────────────
 phase "Step 2 — Select namespace(s)"
 
-# Use jsonpath to get namespace names — no jq needed
 mapfile -t ALL_NS < <(
   kubectl get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
 )
 
 echo -e "\n  ${BOLD}Available namespaces:${RST}"
-for i in "${!ALL_NS[@]}"; do
-  printf "    %3d. %s\n" "$((i+1))" "${ALL_NS[$i]}"
-done
+for i in "${!ALL_NS[@]}"; do printf "    %3d. %s\n" "$((i+1))" "${ALL_NS[$i]}"; done
 echo "      0. All namespaces"
 
 TARGET_NS=()
 while true; do
-  read -rp "$(echo -e "\n  ${YEL}?${RST}  Enter number or namespace name: ")" ns_choice
+  read -rp "$(echo -e "\n  ${YEL}?${RST}  Enter number or name: ")" ns_choice
   if [[ "$ns_choice" == "0" ]]; then
-    TARGET_NS=("${ALL_NS[@]}")
-    info "Scanning: ALL namespaces"
-    break
+    TARGET_NS=("${ALL_NS[@]}"); info "Scanning: ALL"; break
   fi
   if [[ "$ns_choice" =~ ^[0-9]+$ ]]; then
     idx=$((ns_choice - 1))
     if [[ $idx -ge 0 && $idx -lt ${#ALL_NS[@]} ]]; then
-      TARGET_NS=("${ALL_NS[$idx]}")
-      info "Scanning: ${TARGET_NS[0]}"
-      break
+      TARGET_NS=("${ALL_NS[$idx]}"); info "Scanning: ${TARGET_NS[0]}"; break
     fi
   fi
+  matched=false
   for ns in "${ALL_NS[@]}"; do
     if [[ "$ns" == "$ns_choice" ]]; then
-      TARGET_NS=("$ns")
-      info "Scanning: $ns"
-      break 2
+      TARGET_NS=("$ns"); info "Scanning: $ns"; matched=true; break
     fi
   done
+  [[ "$matched" == true ]] && break
   echo "  Invalid. Try again."
 done
 
@@ -223,7 +181,6 @@ log "Namespaces: ${TARGET_NS[*]}"
 # ─── Step 3: Collect secrets ──────────────────────────────────────────────────
 phase "Step 3 — Collecting secrets from cluster"
 
-# Result arrays
 ENTRY_KV_NAME=()
 ENTRY_CLUSTER_VAL=()
 ENTRY_NS=()
@@ -231,8 +188,7 @@ ENTRY_NS=()
 for ns in "${TARGET_NS[@]}"; do
   info "Scanning namespace: $ns"
 
-  # Get all secret names and types in this namespace using jsonpath
-  # Format: name|type per line
+  # Get all secret names and types — one kubectl call per namespace
   mapfile -t SECRET_LINES < <(
     kubectl get secrets -n "$ns" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.type}{"\n"}{end}' \
@@ -250,46 +206,26 @@ for ns in "${TARGET_NS[@]}"; do
     is_system_secret "$secret_name" "$secret_type" && continue
     ((app_count++)) || true
 
-    # Get all keys for this secret using jsonpath
-    mapfile -t KEYS < <(
+    # Get all keys for this secret — go-template is most reliable for arbitrary key names
+    mapfile -t KEY_LINES < <(
       kubectl get secret "$secret_name" -n "$ns" \
-        -o jsonpath='{range .data}{@}{"!"}{end}' 2>/dev/null \
-        | tr '!' '\n' | grep -v '^$' || true
-    )
-
-    # Better approach: get keys list
-    mapfile -t KEYS < <(
-      kubectl get secret "$secret_name" -n "$ns" \
-        -o jsonpath='{range $..data}{range @.*}{@}{"\n"}{end}{end}' 2>/dev/null \
-        | grep -v '^$' || true
-    )
-
-    # jsonpath for keys only
-    keys_raw=$(kubectl get secret "$secret_name" -n "$ns" \
-      -o jsonpath='{.data}' 2>/dev/null || echo "")
-
-    # If data is empty, skip
-    [[ -z "$keys_raw" || "$keys_raw" == "{}" ]] && continue
-
-    # Get each key-value pair using jsonpath with known key name
-    # First get all keys via go template (more reliable for arbitrary key names)
-    mapfile -t KEYS < <(
-      kubectl get secret "$secret_name" -n "$ns" \
-        --template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{end}}' \
+        -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}' \
         2>/dev/null | grep -v '^$' || true
     )
 
-    for key in "${KEYS[@]}"; do
+    [[ ${#KEY_LINES[@]} -eq 0 ]] && continue
+
+    for key in "${KEY_LINES[@]}"; do
       [[ -z "$key" ]] && continue
 
-      # Get b64 value for this specific key
+      # Get b64 value for this key using jsonpath index notation
       b64val=$(kubectl get secret "$secret_name" -n "$ns" \
-        --template="{{index .data \"${key}\"}}" 2>/dev/null | tr -d '\r' || echo "")
+        -o jsonpath="{.data['${key}']}" 2>/dev/null | tr -d '\r\n' || echo "")
 
       if [[ -z "$b64val" ]]; then
         cluster_val=""
       else
-        cluster_val=$(echo "$b64val" | base64 --decode 2>/dev/null | tr -d '\r' || echo "")
+        cluster_val=$(printf '%s' "$b64val" | base64 --decode 2>/dev/null | tr -d '\r' || echo "")
       fi
 
       ENTRY_KV_NAME+=("$key")
@@ -303,26 +239,19 @@ for ns in "${TARGET_NS[@]}"; do
 done
 
 total=${#ENTRY_KV_NAME[@]}
-info "Total secret keys to check: $total"
+info "Total keys to check: $total"
 log "Total entries: $total"
 
 if [[ "$total" -eq 0 ]]; then
-  warn "No secrets found to check."
-  exit 0
+  warn "No secrets found."; exit 0
 fi
 
-# ─── Step 4: Check each against KV ───────────────────────────────────────────
+# ─── Step 4: Check against KV ────────────────────────────────────────────────
 phase "Step 4 — Checking against Key Vault"
 
-MISSING_NAMES=()
-MISSING_VALUES=()
-MISSING_NS=()
-MISMATCH_NAMES=()
-MISMATCH_CLUSTER=()
-MISMATCH_KV=()
-MISMATCH_NS=()
-MATCHED=0
-DECODE_ERRORS=0
+MISSING_NAMES=(); MISSING_VALUES=(); MISSING_NS=()
+MISMATCH_NAMES=(); MISMATCH_CLUSTER=(); MISMATCH_KV=(); MISMATCH_NS=()
+MATCHED=0; DECODE_ERRORS=0
 
 for i in "${!ENTRY_KV_NAME[@]}"; do
   kv_name="${ENTRY_KV_NAME[$i]}"
@@ -331,12 +260,10 @@ for i in "${!ENTRY_KV_NAME[@]}"; do
   current=$((i + 1))
 
   echo -e "\n  ${BOLD}[$current/$total]${RST} $kv_name  ${DIM}(ns: $ns)${RST}"
-  log_section "[$current/$total] $kv_name"
-  log "  Namespace     : $ns"
-  log "  KV name       : $kv_name"
+  log_section "[$current/$total] $kv_name | ns: $ns"
 
   if [[ -z "$cluster_val" ]]; then
-    warn "Could not decode cluster value — skipping"
+    warn "Could not decode — skipping"
     log "  STATUS: DECODE ERROR"
     ((DECODE_ERRORS++)) || true
     continue
@@ -355,8 +282,8 @@ for i in "${!ENTRY_KV_NAME[@]}"; do
   fi
 
   kv_val=$(kv_get "$kv_name")
-  log "  KV VALUE      : $kv_val"
-  log "  KV HASH       : $(safe_hash "$kv_val")"
+  log "  KV VALUE : $kv_val"
+  log "  KV HASH  : $(safe_hash "$kv_val")"
 
   if show_comparison "$kv_name" "$cluster_val" "$kv_val"; then
     log "  STATUS: MATCH"
@@ -374,24 +301,21 @@ done
 phase "Step 5 — Summary"
 
 echo -e "
-  ${GRN}Matched (cluster = KV)${RST}    : $MATCHED
-  ${YEL}Missing from KV${RST}          : ${#MISSING_NAMES[@]}
-  ${YEL}Mismatch (values differ)${RST} : ${#MISMATCH_NAMES[@]}
-  ${DIM}Decode errors (skipped)${RST}  : $DECODE_ERRORS
+  ${GRN}Matched${RST}          : $MATCHED
+  ${YEL}Missing from KV${RST} : ${#MISSING_NAMES[@]}
+  ${YEL}Mismatch${RST}         : ${#MISMATCH_NAMES[@]}
+  ${DIM}Decode errors${RST}    : $DECODE_ERRORS
 "
 
 log_section "SUMMARY"
-log "  Matched        : $MATCHED"
-log "  Missing from KV: ${#MISSING_NAMES[@]}"
-log "  Mismatch       : ${#MISMATCH_NAMES[@]}"
-log "  Decode errors  : $DECODE_ERRORS"
+log "  Matched: $MATCHED | Missing: ${#MISSING_NAMES[@]} | Mismatch: ${#MISMATCH_NAMES[@]} | Errors: $DECODE_ERRORS"
 
 if [[ ${#MISSING_NAMES[@]} -gt 0 ]]; then
   echo -e "\n  ${BOLD}Missing from KV:${RST}"
   log_section "MISSING FROM KV"
   for i in "${!MISSING_NAMES[@]}"; do
     echo -e "    ${RED}✘${RST} ${MISSING_NAMES[$i]}  ${DIM}(ns: ${MISSING_NS[$i]})${RST}"
-    log "  ${MISSING_NAMES[$i]} | ns: ${MISSING_NS[$i]} | cluster value: ${MISSING_VALUES[$i]}"
+    log "  ${MISSING_NAMES[$i]} | ns: ${MISSING_NS[$i]} | value: ${MISSING_VALUES[$i]}"
   done
 fi
 
@@ -405,29 +329,27 @@ if [[ ${#MISMATCH_NAMES[@]} -gt 0 ]]; then
 fi
 
 if [[ "$DRY_RUN" == true ]]; then
-  echo -e "\n  ${YEL}Dry run — stopping here. No changes made.${RST}\n"
-  exit 0
+  echo -e "\n  ${YEL}Dry run — no changes made.${RST}\n"; exit 0
 fi
 
-# ─── Step 6: Upload missing secrets ──────────────────────────────────────────
+# ─── Step 6: Upload missing ───────────────────────────────────────────────────
 if [[ ${#MISSING_NAMES[@]} -gt 0 ]]; then
   phase "Step 6 — Upload missing secrets to KV"
 
-  read -rp "$(echo -e "\n  ${YEL}?${RST}  Upload ${#MISSING_NAMES[@]} missing secret(s) to KV? [y/n]: ")" bulk
-
+  read -rp "$(echo -e "\n  ${YEL}?${RST}  Upload ${#MISSING_NAMES[@]} missing secret(s)? [y/n]: ")" bulk
   if [[ "$bulk" == "y" ]]; then
     for i in "${!MISSING_NAMES[@]}"; do
       kv_name="${MISSING_NAMES[$i]}"
       cluster_val="${MISSING_VALUES[$i]}"
 
       echo -e "\n  ${BOLD}$kv_name${RST}"
-      info "Cluster value : $cluster_val"
-      info "Cluster hash  : $(safe_hash "$cluster_val" | cut -c1-32)…"
+      info "Value : $cluster_val"
+      info "Hash  : $(safe_hash "$cluster_val" | cut -c1-32)…"
 
-      read -rp "$(echo -e "\n  ${YEL}?${RST}  Upload this secret? [y/skip/pause]: ")" confirm
+      read -rp "$(echo -e "\n  ${YEL}?${RST}  Upload? [y/skip/pause]: ")" confirm
       case "$confirm" in
-        skip)  warn "Skipped"; log "  UPLOAD SKIPPED: $kv_name"; continue ;;
-        pause) read -rp "  Paused. Press Enter to continue..."; log "  UPLOAD PAUSED: $kv_name"; continue ;;
+        skip)  warn "Skipped"; log "  SKIPPED: $kv_name"; continue ;;
+        pause) read -rp "  Paused. Press Enter..."; log "  PAUSED: $kv_name"; continue ;;
         y) ;;
         *) warn "Invalid — skipping"; continue ;;
       esac
@@ -436,9 +358,9 @@ if [[ ${#MISSING_NAMES[@]} -gt 0 ]]; then
 
       if [[ "$upload_ok" == false ]]; then
         err "Upload failed: $upload_out"
-        log "  UPLOAD FAILED: $kv_name | error: $upload_out"
+        log "  UPLOAD FAILED: $kv_name | $upload_out"
         read -rp "$(echo -e "\n  ${YEL}?${RST}  [pause/skip]: ")" action
-        [[ "$action" == "pause" ]] && read -rp "  Press Enter to continue..."
+        [[ "$action" == "pause" ]] && read -rp "  Press Enter..."
         continue
       fi
 
@@ -447,8 +369,7 @@ if [[ ${#MISSING_NAMES[@]} -gt 0 ]]; then
 
       if show_comparison "$kv_name" "$cluster_val" "$kv_val_after"; then
         version=$(kv_version "$kv_name")
-        ok "Uploaded and verified"
-        info "KV version: $version"
+        ok "Uploaded and verified | version: $version"
         log "  UPLOADED OK: $kv_name | version: $version | value: $cluster_val"
       else
         err "Checksum mismatch after upload!"
@@ -456,8 +377,7 @@ if [[ ${#MISSING_NAMES[@]} -gt 0 ]]; then
         read -rp "$(echo -e "\n  ${YEL}?${RST}  [retry/skip/pause]: ")" action
         case "$action" in
           retry) kv_set "$kv_name" "$cluster_val" >/dev/null; ok "Retried"; log "  RETRIED: $kv_name" ;;
-          pause) read -rp "  Press Enter to continue..." ;;
-          *) log "  SKIPPED AFTER MISMATCH: $kv_name" ;;
+          pause) read -rp "  Press Enter..." ;;
         esac
       fi
     done
@@ -467,8 +387,7 @@ fi
 # ─── Step 7: Handle mismatches ────────────────────────────────────────────────
 if [[ ${#MISMATCH_NAMES[@]} -gt 0 ]]; then
   phase "Step 7 — Handle mismatched secrets"
-  warn "These secrets exist in both cluster and KV but values differ."
-  warn "Cluster is source of truth."
+  warn "Cluster is source of truth — overwrite will replace KV value."
 
   for i in "${!MISMATCH_NAMES[@]}"; do
     kv_name="${MISMATCH_NAMES[$i]}"
@@ -480,33 +399,28 @@ if [[ ${#MISMATCH_NAMES[@]} -gt 0 ]]; then
 
     read -rp "$(echo -e "\n  ${YEL}?${RST}  [overwrite/skip/pause]: ")" action
     case "$action" in
-      skip)      log "  MISMATCH SKIPPED: $kv_name"; continue ;;
-      pause)     read -rp "  Press Enter to continue..."; log "  MISMATCH PAUSED: $kv_name"; continue ;;
+      skip)      log "  SKIPPED: $kv_name"; continue ;;
+      pause)     read -rp "  Press Enter..."; log "  PAUSED: $kv_name"; continue ;;
       overwrite) ;;
-      *)         warn "Invalid — skipping"; log "  MISMATCH SKIPPED: $kv_name"; continue ;;
+      *)         warn "Invalid — skipping"; continue ;;
     esac
 
     upload_out=$(kv_set "$kv_name" "$cluster_val") && upload_ok=true || upload_ok=false
-
     if [[ "$upload_ok" == false ]]; then
-      err "Upload failed: $upload_out"
-      log "  OVERWRITE FAILED: $kv_name | error: $upload_out"
-      continue
+      err "Upload failed: $upload_out"; log "  OVERWRITE FAILED: $kv_name"; continue
     fi
 
     kv_val_after=$(kv_get "$kv_name")
     if show_comparison "$kv_name" "$cluster_val" "$kv_val_after"; then
-      ok "Overwritten and verified"
-      log "  OVERWRITTEN OK: $kv_name | value: $cluster_val"
+      ok "Overwritten and verified"; log "  OVERWRITTEN OK: $kv_name | value: $cluster_val"
     else
-      err "Still mismatched after overwrite!"
-      log "  OVERWRITE MISMATCH: $kv_name"
+      err "Still mismatched!"; log "  OVERWRITE MISMATCH: $kv_name"
     fi
   done
 fi
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
 phase "Done"
-echo -e "  ${GRN}${BOLD}Reconciliation complete.${RST}"
-echo -e "  ${DIM}Full log: $LOG_FILE${RST}\n"
-log ""; log "========================================================================"; log "RECONCILIATION COMPLETE"
+echo -e "  ${GRN}${BOLD}Complete.${RST}"
+echo -e "  ${DIM}Log: $LOG_FILE${RST}\n"
+log ""; log "========================================"; log "COMPLETE"
