@@ -1,0 +1,310 @@
+# =============================================================================
+# failover.yml
+# Manual trigger pipeline — initiate or revert backup cluster failover
+#
+# Modes:
+#   scale-up   — scale backup (oc-uat) from 0 → 1 (activate backup)
+#   scale-down — scale backup (oc-uat) from 1 → 0 (revert to main)
+#
+# Namespace selection:
+#   all        — affects every service folder under apps/oc-uat
+#   specific   — comma-separated list e.g. "biller,ncbakemobilemoneyapi"
+#
+# What it does:
+#   1. Fetches available namespaces from cluster dynamically
+#   2. Edits patch-deployment.yaml replicas value per selected service
+#   3. Commits and pushes to repo (ArgoCD/OC picks it up automatically)
+#   4. Sends Teams confirmation with what was changed
+#
+# Required pipeline variables (set in Azure DevOps → Library):
+#   TEAMS_WEBHOOK_URL   — incoming webhook URL from Teams channel
+#   KUBECONFIG_CONTENT  — base64-encoded kubeconfig for the main cluster
+#   GIT_PAT             — Personal Access Token with repo read/write access
+#   GIT_USER_EMAIL      — email for git commit author
+#   GIT_USER_NAME       — name for git commit author e.g. "NCBA DevOps Bot"
+# =============================================================================
+
+trigger: none  # Manual only — never auto-triggered
+
+parameters:
+  - name: direction
+    displayName: "Failover Direction"
+    type: string
+    default: scale-up
+    values:
+      - scale-up    # Activate backup (0 → 1)
+      - scale-down  # Revert to main  (1 → 0)
+
+  - name: namespaceMode
+    displayName: "Namespace Selection"
+    type: string
+    default: all
+    values:
+      - all       # All services under apps/oc-uat
+      - specific  # Specify below
+
+  - name: specificNamespaces
+    displayName: "Specific Namespaces (comma-separated, only if mode=specific)"
+    type: string
+    default: "none"
+    # Examples: "biller,ncbakemobilemoneyapi,spg"
+    # Find namespace for a service: kubectl get ns
+    # Each value here is the Kubernetes namespace name, NOT the folder name
+    # The pipeline maps namespace → service folders automatically
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: cluster-failover-vars
+
+jobs:
+  - job: failover
+    displayName: "Backup Cluster Failover"
+    timeoutInMinutes: 15
+    steps:
+
+      - task: CmdLine@2
+        displayName: "Install yq"
+        inputs:
+          script: |
+            wget -qO /usr/local/bin/yq \
+              https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x /usr/local/bin/yq
+            yq --version
+
+      - task: CmdLine@2
+        displayName: "Configure kubectl"
+        inputs:
+          script: |
+            mkdir -p ~/.kube
+            echo "$(KUBECONFIG_CONTENT)" | base64 --decode > ~/.kube/config
+            chmod 600 ~/.kube/config
+            kubectl cluster-info --request-timeout=10s
+
+      - task: CmdLine@2
+        displayName: "Configure git"
+        inputs:
+          script: |
+            git config --global user.email "$(GIT_USER_EMAIL)"
+            git config --global user.name "$(GIT_USER_NAME)"
+
+            # Set up authenticated remote using PAT
+            # Encodes PAT into the remote URL for push access
+            REPO_URL="https://$(GIT_PAT)@dev.azure.com/NCBA-GROUP/NCBA%20DevOps/_git/k8s-core-gitops"
+            git remote set-url origin "$REPO_URL"
+
+      - task: CmdLine@2
+        displayName: "Run failover"
+        inputs:
+          script: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            DIRECTION="${{ parameters.direction }}"
+            NS_MODE="${{ parameters.namespaceMode }}"
+            SPECIFIC_NS="${{ parameters.specificNamespaces }}"
+            TEAMS_WEBHOOK="$(TEAMS_WEBHOOK_URL)"
+            OC_UAT_DIR="apps/oc-uat"
+
+            # Set replica target based on direction
+            if [[ "$DIRECTION" == "scale-up" ]]; then
+              TARGET_REPLICAS=1
+              ACTION_LABEL="FAILOVER — Activating backup cluster"
+              EMOJI="🟢"
+            else
+              TARGET_REPLICAS=0
+              ACTION_LABEL="REVERT — Scaling down backup cluster"
+              EMOJI="🔵"
+            fi
+
+            echo "Direction     : $DIRECTION (replicas → $TARGET_REPLICAS)"
+            echo "Namespace mode: $NS_MODE"
+            [[ "$NS_MODE" == "specific" ]] && echo "Namespaces    : $SPECIFIC_NS"
+
+            # ── Build list of target namespaces ───────────────────────────────
+            declare -a TARGET_NAMESPACES
+
+            if [[ "$NS_MODE" == "all" ]]; then
+              # Get all namespaces dynamically from cluster
+              mapfile -t TARGET_NAMESPACES < <(
+                kubectl get namespaces \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+                  --request-timeout=15s 2>/dev/null || true
+              )
+              echo "Fetched ${#TARGET_NAMESPACES[@]} namespaces from cluster"
+            else
+              # Parse comma-separated input
+              IFS=',' read -ra TARGET_NAMESPACES <<< "$SPECIFIC_NS"
+              # Trim spaces
+              for i in "${!TARGET_NAMESPACES[@]}"; do
+                TARGET_NAMESPACES[$i]=$(echo "${TARGET_NAMESPACES[$i]}" | tr -d ' ')
+              done
+              echo "Using specified namespaces: ${TARGET_NAMESPACES[*]}"
+            fi
+
+            # ── Map namespaces to oc-uat service folders ───────────────────────
+            # Each folder in apps/oc-uat contains a patch-deployment.yaml
+            # We find folders whose patch-deployment.yaml has a namespace
+            # matching the target namespaces
+
+            CHANGED_FILES=()
+            SKIPPED=()
+            ERRORS=()
+
+            echo ""
+            echo "Scanning $OC_UAT_DIR for service folders..."
+
+            # Get all service folders that have a patch-deployment.yaml
+            mapfile -t SERVICE_FOLDERS < <(
+              find "$OC_UAT_DIR" -name "patch-deployment.yaml" \
+                -not -path "*/.*" | sort
+            )
+
+            echo "Found ${#SERVICE_FOLDERS[@]} patch-deployment.yaml files"
+
+            for patch_file in "${SERVICE_FOLDERS[@]}"; do
+              folder=$(dirname "$patch_file")
+              folder_name=$(basename "$folder")
+
+              # Get the namespace from the Deployment doc in this patch file
+              # The file has multiple YAML docs (SPC + Deployment) separated by ---
+              # We specifically target the Deployment document
+              file_ns=$(yq eval-all \
+                'select(.kind == "Deployment") | .metadata.namespace' \
+                "$patch_file" 2>/dev/null | head -1 | tr -d '\r' || echo "")
+
+              if [[ -z "$file_ns" || "$file_ns" == "null" ]]; then
+                echo "  SKIP $folder_name — could not read namespace"
+                SKIPPED+=("$folder_name (no namespace found)")
+                continue
+              fi
+
+              # Check if this namespace is in our target list
+              match=false
+              if [[ "$NS_MODE" == "all" ]]; then
+                match=true
+              else
+                for target_ns in "${TARGET_NAMESPACES[@]}"; do
+                  if [[ "$file_ns" == "$target_ns" ]]; then
+                    match=true
+                    break
+                  fi
+                done
+              fi
+
+              if [[ "$match" == false ]]; then
+                continue  # Not a target namespace — skip silently
+              fi
+
+              # Get current replica value
+              current_replicas=$(yq eval-all \
+                'select(.kind == "Deployment") | .spec.replicas' \
+                "$patch_file" 2>/dev/null | head -1 | tr -d '\r' || echo "unknown")
+
+              echo "  Processing: $folder_name (ns: $file_ns, current replicas: $current_replicas → $TARGET_REPLICAS)"
+
+              # Skip if already at target value
+              if [[ "$current_replicas" == "$TARGET_REPLICAS" ]]; then
+                echo "  SKIP $folder_name — already at $TARGET_REPLICAS"
+                SKIPPED+=("$folder_name (already at $TARGET_REPLICAS)")
+                continue
+              fi
+
+              # Edit the replicas value — only on Deployment document
+              if yq eval-all -i \
+                'select(.kind == "Deployment") .spec.replicas = '"$TARGET_REPLICAS"' |
+                 select(.kind != "Deployment")' \
+                "$patch_file" 2>/dev/null; then
+                echo "  ✔ Updated: $folder_name"
+                CHANGED_FILES+=("$folder_name (ns: $file_ns, $current_replicas → $TARGET_REPLICAS)")
+              else
+                echo "  ERROR: Failed to update $folder_name"
+                ERRORS+=("$folder_name")
+              fi
+            done
+
+            echo ""
+            echo "Changed : ${#CHANGED_FILES[@]}"
+            echo "Skipped : ${#SKIPPED[@]}"
+            echo "Errors  : ${#ERRORS[@]}"
+
+            # ── Commit and push if anything changed ───────────────────────────
+            if [[ ${#CHANGED_FILES[@]} -gt 0 ]]; then
+              echo ""
+              echo "Committing changes..."
+
+              git add "$OC_UAT_DIR"
+
+              COMMIT_MSG="ops: $ACTION_LABEL"
+              if [[ "$NS_MODE" == "specific" ]]; then
+                COMMIT_MSG="$COMMIT_MSG — namespaces: $SPECIFIC_NS"
+              fi
+              COMMIT_MSG="$COMMIT_MSG [skip ci]"
+
+              git commit -m "$COMMIT_MSG"
+              git push origin HEAD
+
+              echo "✔ Pushed to repo — ArgoCD/OC will pick up changes automatically"
+            else
+              echo "No files changed — nothing to commit"
+            fi
+
+            # ── Build Teams message ───────────────────────────────────────────
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+            # Build changed list for Teams
+            CHANGED_TEXT=""
+            for item in "${CHANGED_FILES[@]}"; do
+              CHANGED_TEXT+="✅ $item\n"
+            done
+            [[ -z "$CHANGED_TEXT" ]] && CHANGED_TEXT="None"
+
+            SKIPPED_TEXT=""
+            for item in "${SKIPPED[@]}"; do
+              SKIPPED_TEXT+="– $item\n"
+            done
+            [[ -z "$SKIPPED_TEXT" ]] && SKIPPED_TEXT="None"
+
+            ERROR_TEXT=""
+            for item in "${ERRORS[@]}"; do
+              ERROR_TEXT+="❌ $item\n"
+            done
+            [[ -z "$ERROR_TEXT" ]] && ERROR_TEXT="None"
+
+            # Escape for JSON
+            esc() { echo -e "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/g' | tr -d '\n'; }
+
+            curl -s -X POST "$TEAMS_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"@type\": \"MessageCard\",
+                \"@context\": \"http://schema.org/extensions\",
+                \"themeColor\": \"$([ "$DIRECTION" == "scale-up" ] && echo "00CC00" || echo "0078D4")\",
+                \"summary\": \"$ACTION_LABEL\",
+                \"sections\": [
+                  {
+                    \"activityTitle\": \"$EMOJI $ACTION_LABEL\",
+                    \"activitySubtitle\": \"$TIMESTAMP — triggered by $(BUILD_REQUESTEDFOR)\",
+                    \"facts\": [
+                      { \"name\": \"Direction\", \"value\": \"$DIRECTION (replicas → $TARGET_REPLICAS)\" },
+                      { \"name\": \"Namespaces\", \"value\": \"$NS_MODE$([ "$NS_MODE" == "specific" ] && echo ": $SPECIFIC_NS" || echo "")\" },
+                      { \"name\": \"Changed\", \"value\": \"${#CHANGED_FILES[@]} service(s)\" },
+                      { \"name\": \"Skipped\", \"value\": \"${#SKIPPED[@]}\" },
+                      { \"name\": \"Errors\", \"value\": \"${#ERRORS[@]}\" }
+                    ]
+                  },
+                  {
+                    \"activityTitle\": \"Changed services\",
+                    \"activityText\": \"$(esc "$CHANGED_TEXT")\"
+                  }
+                ]
+              }" || echo "WARNING: Could not send Teams alert"
+
+            # Fail pipeline if there were errors
+            if [[ ${#ERRORS[@]} -gt 0 ]]; then
+              echo "Pipeline completed with ${#ERRORS[@]} error(s)"
+              exit 1
+            fi
+
+            echo "Done"
