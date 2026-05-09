@@ -7,15 +7,16 @@
 #   - CrashLoopBackOff pods
 #   - OOMKilled pods
 #   - ImagePullBackOff pods
-#   - Pending pods > 5 minutes
+#   - Pending pods
 #   - Deployments with 0 ready replicas (when desired > 0)
 #
-# On issues found: sends Teams alert via webhook
-# Idempotent: tracks last alerted issues to avoid spam
+# On issues found: sends Teams alert via Power Automate Workflows webhook
 #
-# Required pipeline variables (set in Azure DevOps → Library):
-#   TEAMS_WEBHOOK_URL   — incoming webhook URL from Teams channel
-#   KUBECONFIG_CONTENT  — base64-encoded kubeconfig for the main cluster
+# Required pipeline variables (set in Azure DevOps → Library → cluster-failover-vars):
+#   TEAMS_WEBHOOK_URL   — Power Automate Workflows webhook URL
+#
+# NOTE: No KUBECONFIG_CONTENT needed when running on self-hosted in-cluster agent.
+#       kubectl uses the pod's ServiceAccount token automatically (in-cluster auth).
 # =============================================================================
 
 trigger: none
@@ -29,34 +30,16 @@ schedules:
     always: true                 # Run even if no repo changes
 
 pool:
-  vmImage: ubuntu-latest
+  vmImage: ubuntu-latest          # Switch to: name: k8s-cluster-pool  once agent is deployed
 
 variables:
-  - group: cluster-failover-vars  # Library group containing secrets
+  - group: cluster-failover-vars
 
 jobs:
   - job: healthCheck
     displayName: "Cluster Health Check"
     timeoutInMinutes: 8           # Fail fast if kubectl hangs
     steps:
-
-      - task: CmdLine@2
-        displayName: "Install yq"
-        inputs:
-          script: |
-            wget -qO /usr/local/bin/yq \
-              https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-            chmod +x /usr/local/bin/yq
-            yq --version
-
-      - task: CmdLine@2
-        displayName: "Configure kubectl"
-        inputs:
-          script: |
-            mkdir -p ~/.kube
-            echo "$(KUBECONFIG_CONTENT)" | base64 --decode > ~/.kube/config
-            chmod 600 ~/.kube/config
-            kubectl cluster-info --request-timeout=10s
 
       - task: CmdLine@2
         displayName: "Run health checks"
@@ -67,9 +50,75 @@ jobs:
 
             TEAMS_WEBHOOK="$(TEAMS_WEBHOOK_URL)"
             ISSUES_FOUND=false
-            ALERT_BODY=""
             NAMESPACES_CHECKED=0
             NAMESPACES_FAILED=0
+
+            # ── Helper: send Adaptive Card to Teams Workflows webhook ─────────
+            send_teams_alert() {
+              local title="$1"
+              local subtitle="$2"
+              local body_text="$3"
+              local color="$4"        # "attention" | "good" | "accent"
+              local footer_text="${5:-}"
+
+              local body_escaped
+              body_escaped=$(printf '%s' "$body_text" | \
+                python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+              local footer_block=""
+              if [[ -n "$footer_text" ]]; then
+                local footer_escaped
+                footer_escaped=$(printf '%s' "$footer_text" | \
+                  python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+                footer_block=",{
+                  \"type\": \"TextBlock\",
+                  \"text\": $footer_escaped,
+                  \"wrap\": true,
+                  \"spacing\": \"Medium\",
+                  \"color\": \"Accent\"
+                }"
+              fi
+
+              curl -s -X POST "$TEAMS_WEBHOOK" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"type\": \"message\",
+                  \"attachments\": [
+                    {
+                      \"contentType\": \"application/vnd.microsoft.card.adaptive\",
+                      \"content\": {
+                        \"\$schema\": \"http://adaptivecards.io/schemas/adaptive-card.json\",
+                        \"type\": \"AdaptiveCard\",
+                        \"version\": \"1.4\",
+                        \"body\": [
+                          {
+                            \"type\": \"TextBlock\",
+                            \"text\": \"$title\",
+                            \"weight\": \"Bolder\",
+                            \"size\": \"Large\",
+                            \"color\": \"$color\",
+                            \"wrap\": true
+                          },
+                          {
+                            \"type\": \"TextBlock\",
+                            \"text\": \"$subtitle\",
+                            \"isSubtle\": true,
+                            \"wrap\": true,
+                            \"spacing\": \"None\"
+                          },
+                          {
+                            \"type\": \"TextBlock\",
+                            \"text\": $body_escaped,
+                            \"wrap\": true,
+                            \"spacing\": \"Medium\"
+                          }
+                          $footer_block
+                        ]
+                      }
+                    }
+                  ]
+                }" || echo "WARNING: Could not send Teams alert"
+            }
 
             # ── Get all namespaces dynamically ────────────────────────────────
             echo "Fetching namespaces..."
@@ -81,36 +130,28 @@ jobs:
 
             if [[ ${#NAMESPACES[@]} -eq 0 ]]; then
               echo "ERROR: Could not fetch namespaces"
-              curl -s -X POST "$TEAMS_WEBHOOK" \
-                -H "Content-Type: application/json" \
-                -d '{
-                  "@type": "MessageCard",
-                  "@context": "http://schema.org/extensions",
-                  "themeColor": "FF0000",
-                  "summary": "Cluster health check failed",
-                  "sections": [{
-                    "activityTitle": "🚨 Health Check Failed",
-                    "activitySubtitle": "Could not connect to cluster to fetch namespaces",
-                    "activityText": "Manual investigation required."
-                  }]
-                }' || true
+              send_teams_alert \
+                "🚨 Health Check Failed" \
+                "$(date -u '+%Y-%m-%d %H:%M UTC')" \
+                "Could not connect to cluster to fetch namespaces. Manual investigation required." \
+                "attention" \
+                ""
               exit 1
             fi
 
             echo "Found ${#NAMESPACES[@]} namespaces"
 
-            # Skip system namespaces
+            # System namespaces to skip — not application workloads
             SKIP_NS=(
               "kube-system" "kube-public" "kube-node-lease"
               "flux-system" "istio-system" "azuremonitor-containers"
-              "azure-arc" "default"
+              "azure-arc" "default" "azdo-agent"
             )
 
             # ── Check each namespace ──────────────────────────────────────────
             NS_ISSUES=""
 
             for ns in "${NAMESPACES[@]}"; do
-              # Skip system namespaces
               skip=false
               for s in "${SKIP_NS[@]}"; do
                 [[ "$ns" == "$s" ]] && skip=true && break
@@ -120,7 +161,7 @@ jobs:
               ((NAMESPACES_CHECKED++)) || true
               ns_issues=""
 
-              # Get all pods in namespace — single kubectl call
+              # Single kubectl call — get all pod state needed for checks
               pod_data=$(kubectl get pods -n "$ns" \
                 --no-headers \
                 --request-timeout=10s \
@@ -134,51 +175,59 @@ jobs:
                 2>/dev/null || echo "ERROR")
 
               if [[ "$pod_data" == "ERROR" || -z "$pod_data" ]]; then
-                ns_issues+="  ⚠️ Could not fetch pod data\n"
+                ns_issues+="⚠️ Could not fetch pod data\n"
                 ((NAMESPACES_FAILED++)) || true
               else
-                # Check for CrashLoopBackOff
+                # CrashLoopBackOff
                 crash_pods=$(echo "$pod_data" | grep "CrashLoopBackOff" \
                   | awk '{print $1}' || true)
                 if [[ -n "$crash_pods" ]]; then
                   count=$(echo "$crash_pods" | wc -l | tr -d ' ')
-                  ns_issues+="  🔴 CrashLoopBackOff: $count pod(s)\n"
+                  ns_issues+="🔴 CrashLoopBackOff: $count pod(s)\n"
                   while IFS= read -r pod; do
-                    ns_issues+="     - $pod\n"
+                    ns_issues+="  - $pod\n"
                   done <<< "$crash_pods"
                 fi
 
-                # Check for OOMKilled
+                # OOMKilled — requires separate call for lastState
                 oom_pods=$(kubectl get pods -n "$ns" --no-headers \
                   -o custom-columns="NAME:.metadata.name,REASON:.status.containerStatuses[0].lastState.terminated.reason" \
                   --request-timeout=10s 2>/dev/null \
                   | grep "OOMKilled" | awk '{print $1}' || true)
                 if [[ -n "$oom_pods" ]]; then
                   count=$(echo "$oom_pods" | wc -l | tr -d ' ')
-                  ns_issues+="  🔴 OOMKilled: $count pod(s)\n"
+                  ns_issues+="🔴 OOMKilled: $count pod(s)\n"
                   while IFS= read -r pod; do
-                    ns_issues+="     - $pod\n"
+                    ns_issues+="  - $pod\n"
                   done <<< "$oom_pods"
                 fi
 
-                # Check for ImagePullBackOff
+                # ImagePullBackOff / ErrImagePull
                 imgpull_pods=$(echo "$pod_data" | \
                   grep -E "ImagePullBackOff|ErrImagePull" \
                   | awk '{print $1}' || true)
                 if [[ -n "$imgpull_pods" ]]; then
                   count=$(echo "$imgpull_pods" | wc -l | tr -d ' ')
-                  ns_issues+="  🟡 ImagePullBackOff: $count pod(s)\n"
+                  ns_issues+="🟡 ImagePullBackOff: $count pod(s)\n"
+                  while IFS= read -r pod; do
+                    ns_issues+="  - $pod\n"
+                  done <<< "$imgpull_pods"
                 fi
 
-                # Check for long-pending pods (creation > 5 min ago)
+                # Pending pods
                 pending_pods=$(echo "$pod_data" | grep "Pending" \
                   | awk '{print $1}' || true)
                 if [[ -n "$pending_pods" ]]; then
-                  ns_issues+="  🟡 Pending pods detected\n"
+                  count=$(echo "$pending_pods" | wc -l | tr -d ' ')
+                  ns_issues+="🟡 Pending: $count pod(s)\n"
+                  while IFS= read -r pod; do
+                    ns_issues+="  - $pod\n"
+                  done <<< "$pending_pods"
                 fi
               fi
 
-              # Check deployments with 0 ready but desired > 0
+              # Deployments with 0 ready but desired > 0
+              # Skips intentionally scaled-down deployments (desired == 0)
               deploy_data=$(kubectl get deployments -n "$ns" \
                 --no-headers \
                 --request-timeout=10s \
@@ -192,62 +241,44 @@ jobs:
                 while IFS= read -r line; do
                   [[ -z "$line" ]] && continue
                   deploy_name=$(echo "$line" | awk '{print $1}')
-                  desired=$(echo "$line" | awk '{print $2}')
-                  ready=$(echo "$line" | awk '{print $3}')
+                  desired=$(echo "$line"     | awk '{print $2}')
+                  ready=$(echo "$line"       | awk '{print $3}')
 
-                  # Skip if desired is 0 (intentionally scaled down)
+                  # Skip intentionally scaled-down deployments
                   [[ "$desired" == "0" || "$desired" == "<none>" ]] && continue
 
-                  # Alert if desired > 0 but ready is 0 or none
                   if [[ "$ready" == "0" || "$ready" == "<none>" ]]; then
-                    ns_issues+="  🔴 Deployment down: $deploy_name (desired: $desired, ready: 0)\n"
+                    ns_issues+="🔴 Deployment down: $deploy_name (desired: $desired, ready: 0)\n"
                   fi
                 done <<< "$deploy_data"
               fi
 
-              # Collect issues for this namespace
               if [[ -n "$ns_issues" ]]; then
                 ISSUES_FOUND=true
-                NS_ISSUES+="**Namespace: \`$ns\`**\n${ns_issues}\n"
+                NS_ISSUES+="**[$ns]**\n${ns_issues}\n"
               fi
             done
 
             echo "Checked $NAMESPACES_CHECKED namespaces, $NAMESPACES_FAILED unreachable"
 
-            # ── Send Teams alert if issues found ──────────────────────────────
+            # ── Send alert or log healthy ─────────────────────────────────────
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+
             if [[ "$ISSUES_FOUND" == true ]]; then
               echo "Issues detected — sending Teams alert"
 
-              # Escape for JSON
-              ESCAPED=$(echo -e "$NS_ISSUES" | \
-                sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/g' | tr -d '\n')
+              FOOTER="To initiate failover: Azure DevOps → Pipelines → failover → Run pipeline. Select namespaces and direction (scale-up or revert)."
 
-              TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
-
-              curl -s -X POST "$TEAMS_WEBHOOK" \
-                -H "Content-Type: application/json" \
-                -d "{
-                  \"@type\": \"MessageCard\",
-                  \"@context\": \"http://schema.org/extensions\",
-                  \"themeColor\": \"FF0000\",
-                  \"summary\": \"Cluster health issues detected\",
-                  \"sections\": [
-                    {
-                      \"activityTitle\": \"🚨 Cluster Health Alert\",
-                      \"activitySubtitle\": \"$TIMESTAMP — $NAMESPACES_CHECKED namespace(s) checked\",
-                      \"activityText\": \"$ESCAPED\"
-                    },
-                    {
-                      \"activityTitle\": \"Actions\",
-                      \"activityText\": \"To initiate failover: go to Azure DevOps → Pipelines → **failover** → Run pipeline\\nSelect namespaces and direction (scale-up or revert)\"
-                    }
-                  ]
-                }" || echo "WARNING: Could not send Teams alert"
+              send_teams_alert \
+                "🚨 Cluster Health Alert" \
+                "$TIMESTAMP — $NAMESPACES_CHECKED namespace(s) checked" \
+                "$(printf '%b' "$NS_ISSUES")" \
+                "attention" \
+                "$FOOTER"
 
               echo "Teams alert sent"
-              # Exit 0 — health check pipeline itself succeeded, issues are expected findings
-              exit 0
             else
               echo "✔ All $NAMESPACES_CHECKED namespaces healthy"
-              exit 0
             fi
+
+            exit 0
