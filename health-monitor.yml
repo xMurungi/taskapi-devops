@@ -56,7 +56,7 @@ jobs:
             #!/usr/bin/env bash
             set -euo pipefail
 
-            TEAMS_WEBHOOK="$(TEAMS_WEBHOOK_URL)"
+            TEAMS_WEBHOOK="$TEAMS_WEBHOOK_URL"
             ISSUES_FOUND=false
             NAMESPACES_CHECKED=0
             NAMESPACES_FAILED=0
