@@ -1,0 +1,198 @@
+---
+# 1. THE SYSTEM
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: retail-core
+  description: The core ecosystem handling e-commerce traffic, checkout, and inventory.
+spec:
+  owner: checkout-team
+---
+# 2. DOMAIN (High-level grouping)
+apiVersion: backstage.io/v1alpha1
+kind: Domain
+metadata:
+  name: e-commerce
+  description: All capabilities related to the digital shopping experience.
+spec:
+  owner: commerce-guild
+---
+# 3. ORGANIZATIONAL GROUP
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: checkout-team
+  description: Engineers responsible for purchase funnels and payment processing.
+spec:
+  type: team
+  children: []
+---
+# 4. USER (Team Member)
+apiVersion: backstage.io/v1alpha1
+kind: User
+metadata:
+  name: jdoe
+  description: Lead Engineer for Checkout Team
+spec:
+  profile:
+    displayName: John Doe
+    email: jdoe@example.com
+  memberOf: [checkout-team]
+---
+# 5. COMPONENT: Frontend Web App
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: shopping-cart-web
+  description: React-based web application for consumer shopping.
+  annotations:
+    github.com/project-slug: internal/shopping-cart-web
+spec:
+  type: website
+  lifecycle: production
+  owner: checkout-team
+  system: retail-core
+  consumesApis: [cart-api, catalog-graphql-api]
+---
+# 6. COMPONENT: Backend Service (Cart API)
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: cart-service
+  description: Handles user shopping baskets and temporary item reservations.
+spec:
+  type: service
+  lifecycle: production
+  owner: checkout-team
+  system: retail-core
+  providesApis: [cart-api]
+  dependsOn: [resource:cart-redis-cache]
+---
+# 7. API: Cart REST API
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: cart-api
+  description: REST API for managing items inside a user's shopping cart.
+spec:
+  type: openapi
+  lifecycle: production
+  owner: checkout-team
+  system: retail-core
+  definition: |
+    openapi: 3.0.1
+    info:
+      title: Cart API
+      version: v1
+    paths:
+      /cart/{userId}:
+        get:
+          summary: Get user cart
+          responses:
+            '200':
+              description: Success
+---
+# 8. RESOURCE: Redis Cache for Cart
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: cart-redis-cache
+  description: Ephemeral Redis instance storing active cart sessions.
+spec:
+  type: database
+  owner: checkout-team
+  system: retail-core
+---
+# 9. COMPONENT: Backend Service (Catalog API)
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: catalog-service
+  description: Serves product details, pricing, and media assets.
+spec:
+  type: service
+  lifecycle: production
+  owner: commerce-guild
+  system: retail-core
+  providesApis: [catalog-graphql-api]
+  dependsOn: [resource:product-postgres-db]
+---
+# 10. API: Catalog GraphQL API
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: catalog-graphql-api
+  description: GraphQL Gateway to query items, categories, and stock availability.
+spec:
+  type: graphql
+  lifecycle: production
+  owner: commerce-guild
+  system: retail-core
+  definition: |
+    type Product {
+      id: ID!
+      name: String!
+      price: Float!
+    }
+    type Query {
+      product(id: ID!): Product
+    }
+---
+# 11. RESOURCE: Postgres Database for Catalog
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: product-postgres-db
+  description: Relational database holding production product master records.
+spec:
+  type: database
+  owner: commerce-guild
+  system: retail-core
+---
+# 12. COMPONENT: Payment Gateway Broker (Experimental)
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: payment-broker
+  description: Outbound processor handling third-party integrations (Stripe/PayPal).
+spec:
+  type: service
+  lifecycle: experimental
+  owner: checkout-team
+  system: retail-core
+---
+# 13. COMPONENT: Data Pipeline (Batch Job)
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: inventory-sync-cron
+  description: Nightly cron job syncing warehouse ERP data to the product database.
+spec:
+  type: bff
+  lifecycle: production
+  owner: commerce-guild
+  system: retail-core
+  dependsOn: [resource:product-postgres-db, resource:inventory-events-queue]
+---
+# 14. RESOURCE: Message Queue
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: inventory-events-queue
+  description: RabbitMQ exchange for distribution center stock changes.
+spec:
+  type: queue
+  owner: commerce-guild
+  system: retail-core
+---
+# 15. COMPONENT: Documentation Library
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: retail-architecture-docs
+  description: Central tech-radar and design proposals for the Retail Core system.
+spec:
+  type: documentation
+  lifecycle: production
+  owner: commerce-guild
+  system: retail-core

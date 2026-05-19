@@ -1,0 +1,23 @@
+FROM node:18-bullseye-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN corepack enable && corepack prepare yarn@4.4.1 --activate
+
+COPY package.json .yarnrc.yml ./
+COPY .yarn ./.yarn
+
+# no --immutable — let yarn resolve and install freely on Linux
+RUN yarn install
+
+COPY . .
+
+EXPOSE 3000 7007
+
+CMD ["yarn", "dev"]

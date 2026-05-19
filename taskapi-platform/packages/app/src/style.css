@@ -1,0 +1,40 @@
+[data-theme-mode='dark'] {
+  --bui-bg-app: #0a0c10;
+  --bui-bg-neutral-1: #161b22;
+  --bui-bg-neutral-2: #21262d;
+  --bui-bg-solid: #238636;
+  --bui-bg-solid-hover: #2ea043;
+  --bui-fg-primary: #e6edf3;
+  --bui-fg-secondary: #8b949e;
+  --bui-fg-success: #3fb950;
+  --bui-border-1: #21262d;
+  --bui-border-2: #1a232e;
+  --bui-font-regular: 'JetBrains Mono', monospace;
+}
+
+/* Sidebar item text */
+.BackstageSidebarItem-label-566,
+[class*="BackstageSidebarItem-label"] {
+  color: #006fef !important;
+}
+
+/* Sidebar item icon */
+[class*="BackstageSidebarItem-itemIcon"] {
+  color: #006fef !important;
+}
+
+/* Selected/active item */
+[class*="BackstageSidebarItem-selected"] [class*="BackstageSidebarItem-label"],
+[class*="BackstageSidebarItem-selected"] [class*="BackstageSidebarItem-itemIcon"] {
+  color: #0084f8 !important;
+}
+
+/* Sidebar background */
+[class*="BackstageSidebar-drawer"] {
+  background-color: #111318 !important;
+}
+
+/* Active indicator bar */
+[class*="BackstageSidebarItem-selected"]::before {
+  background-color: #0084f8 !important;
+}
