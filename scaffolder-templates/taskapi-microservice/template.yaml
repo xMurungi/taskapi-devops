@@ -1,0 +1,110 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: taskapi-microservice
+  title: TaskAPI Microservice
+  description: Scaffolds a Flask microservice with AKS deployment and CI/CD pipeline
+  tags:
+    - python
+    - flask
+    - azure
+    - kubernetes
+spec:
+  owner: platform-team
+  type: service
+
+  parameters:
+    - title: Service Details
+      required: [name, description]
+      properties:
+        name:
+          title: Service name
+          type: string
+          description: Unique name for your service (e.g. payments-api, loans-api)
+          pattern: "^[a-z][a-z0-9-]*[a-z0-9]$"
+          ui:help: "Lowercase letters, numbers and hyphens only"
+        description:
+          title: Description
+          type: string
+          description: What does this service do
+        port:
+          title: Port
+          type: integer
+          default: 5000
+          description: Port your service listens on
+    
+    - title: Azure Infrastructure
+      required: [environment, location]
+      properties:
+        environment:
+          title: Environment
+          type: string
+          enum: [dev, staging, prod]
+          default: dev
+        location:
+          title: Azure Region
+          type: string
+          enum: [eastus, westeurope, southafricanorth]
+          default: eastus
+        node_count:
+          title: AKS Node Count
+          type: integer
+          default: 1
+          minimum: 1
+          maximum: 5
+        replicas:
+          title: Pod replicas
+          type: integer
+          default: 2
+          minimum: 1
+          maximum: 10
+
+    - title: Repository
+      required: [repoUrl]
+      properties:
+        repoUrl:
+          title: Repository location
+          type: string
+          ui:field: RepoUrlPicker
+          ui:options:
+            allowedHosts:
+              - github.com
+  
+  steps:
+    - id: fetch-base
+      name: Fetching base template
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+          description: ${{ parameters.description }}
+          port: ${{ parameters.port }}
+          environment: ${{ parameters.environment }}
+          location: ${{ parameters.location }}
+          node_count: ${{ parameters.node_count }}
+          replicas: ${{ parameters.replicas }}
+
+    - id: publish
+      name: Publishing to Github
+      action: publish:github
+      input:
+        description: ${{ parameters.description }}
+        repoUrl: ${{ parameters.repoUrl }}
+        defaultBranch: main
+        repoVisibility: public
+
+    - id: register
+      name: Registering in catalog
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps['publish'].output.repoContentsUrl }}
+        catalogInfoPath: "/catalog-info.yaml"
+  
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps['publish'].output.remoteUrl }}
+      - title: Open in catalog
+        icon: catalog
+        entityRef: ${{ steps['register'].output.entityRef }}
