@@ -1,8 +1,23 @@
 from flask import Blueprint, jsonify, request, abort
 from .db import db
 from .models import Task
+from prometheus_client import Counter, Histogram
 
 bp = Blueprint("tasks", __name__, url_prefix="/api")
+
+# custom metrics — these are business-level, not just HTTP
+tasks_created = Counter(
+    "taskapi_tasks_created_total",
+    "Total number of tasks created"
+)
+tasks_completed = Counter(
+    "taskapi_tasks_completed_total",
+    "Total number of tasks marked as done"
+)
+active_tasks = Counter(
+    "taskapi_active_tasks_total",
+    "Total number of active tasks"
+)
 
 @bp.get("/health")
 def health():
@@ -36,6 +51,7 @@ def post_task():
     t = Task(title=data["title"])
     db.session.add(t)
     db.session.commit()
+    tasks_created.inc()      # increment counter every time a task is created
     return jsonify(t.to_dict()), 201
 
 @bp.patch("/tasks/<int:task_id>")
@@ -45,6 +61,8 @@ def update_task(task_id):
 
     if "done" in data:
         t.done = data["done"]
+        if data["done"]:
+            tasks_completed.inc()    # increment when task is completed
     if "title" in data:
         t.title = data["title"]
     

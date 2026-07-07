@@ -1,6 +1,7 @@
 import os
 from flask import Flask
 from .db import db
+from prometheus_flask_exporter import PrometheusMetrics
 
 def createApp(config = None):
     app = Flask(__name__)
@@ -15,6 +16,12 @@ def createApp(config = None):
         app.config.update(config)
 
     db.init_app(app)
+
+    # initialise metrics — this adds /metrics endpoint automatically
+    metrics = PrometheusMetrics(app)
+
+    # static info metric — appears as a label on all metrics
+    metrics.info("app_info", "Task API info", version="1.0")
 
     from .routes import bp
     app.register_blueprint(bp)

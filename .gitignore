@@ -19,3 +19,6 @@ terraform/*.tfstate.backup
 terraform/.terraform.lock.hcl
 
 .DS_Store
+instance/
+scaffolder-templates/ncba-csharp-template/
+app/__pycache__/
