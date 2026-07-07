@@ -1,15 +1,25 @@
 import pytest
 from app import createApp
+from app.db import db  # Import your db instance here
 
-@pytest.fixture
-def client():
+@pytest.fixture(scope="session")
+def app():
     app = createApp(
         {
             "TESTING": True,
             "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:"
         }
     )
+    yield app
+
+@pytest.fixture
+def client(app):
     with app.test_client() as c:
+        with app.app_context():
+            # Clear the database tables before each test to keep them isolated
+            db.session.remove()
+            db.drop_all()
+            db.create_all()
         yield c
 
 def test_health(client):
@@ -25,4 +35,4 @@ def test_create_and_get(client):
 def test_missing_title(client):
     r = client.post("/api/tasks", json={})
     assert r.status_code == 400
-
+    
