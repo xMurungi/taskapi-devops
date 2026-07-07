@@ -20,7 +20,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
       },
     },
   }),
-  fontFamily: '"JetBrains Mono", monospace',
+  fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
   defaultPageTheme: 'home',
   components: {
   BackstageSidebar: {
@@ -61,7 +61,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
       body: {
         backgroundColor: '#0a0c10',
         color: '#e6edf3',
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
       },
       // Scrollbar
       '*::-webkit-scrollbar': {
@@ -107,12 +107,12 @@ export const ncbaDarkTheme = createUnifiedTheme({
         fontSize: '14px',
         fontWeight: 700,
         color: '#e6edf3',
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
       },
       subheader: {
         color: '#8b949e',
         fontSize: '12px',
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
       },
     },
   },
@@ -146,7 +146,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
           letterSpacing: '0.08em',
           textTransform: 'uppercase',
           borderBottom: '1px solid #21262d',
-          fontFamily: '"JetBrains Mono", monospace',
+          fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         },
       },
     },
@@ -169,7 +169,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
         borderBottom: '1px solid #21262d',
         color: '#e6edf3',
         fontSize: '13px',
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         padding: '12px 16px',
       },
     },
@@ -177,7 +177,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
   MuiTab: {
     styleOverrides: {
       root: {
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         fontSize: '12px',
         fontWeight: 600,
         letterSpacing: '0.05em',
@@ -205,7 +205,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
   MuiButton: {
     styleOverrides: {
       root: {
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         fontSize: '12px',
         fontWeight: 700,
         letterSpacing: '0.05em',
@@ -232,7 +232,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
   MuiChip: {
     styleOverrides: {
       root: {
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         fontSize: '11px',
         backgroundColor: '#21262d',
         color: '#8b949e',
@@ -249,7 +249,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
   MuiInputBase: {
     styleOverrides: {
       root: {
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         fontSize: '13px',
         backgroundColor: '#0a0c10',
         border: '1px solid #21262d',
@@ -305,7 +305,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
   MuiTypography: {
     styleOverrides: {
       root: {
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
       },
       h1: { color: '#e6edf3' },
       h2: { color: '#e6edf3' },
@@ -338,7 +338,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
         border: '1px solid #21262d',
         color: '#e6edf3',
         fontSize: '11px',
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         borderRadius: '6px',
       },
     },
@@ -346,7 +346,7 @@ export const ncbaDarkTheme = createUnifiedTheme({
   MuiAlert: {
     styleOverrides: {
       root: {
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
         fontSize: '12px',
         borderRadius: '6px',
       },

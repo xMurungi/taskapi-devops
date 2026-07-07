@@ -20,7 +20,7 @@
     "@backstage/frontend-defaults": "^0.5.1",
     "@backstage/frontend-plugin-api": "^0.16.2",
     "@backstage/integration-react": "^1.2.17",
-    "@backstage/plugin-api-docs": "^0.14.0",
+    "@backstage/plugin-api-docs": "^0.14.1",
     "@backstage/plugin-app-react": "^0.2.2",
     "@backstage/plugin-app-visualizer": "^0.2.2",
     "@backstage/plugin-auth": "^0.1.7",

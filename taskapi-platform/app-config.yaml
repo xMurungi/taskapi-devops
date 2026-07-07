@@ -119,6 +119,11 @@ catalog:
       target: /Users/richdestiny/SWE Projects/TaskAPI/scaffolder-templates/taskapi-microservice/template.yaml
       rules:
         - allow: [Template]
+    
+    - type: file
+      target: /Users/richdestiny/SWE Projects/TaskAPI/scaffolder-templates/ncba-csharp-template/template.yaml
+      rules:
+        - allow: [Template]
 
     # - type: url
     #   target: https://github.com/xmurungi/taskapi-devops/blob/main/scaffolder-templates/taskapi-microservice/template.yaml
